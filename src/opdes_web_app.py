@@ -4,7 +4,9 @@ import json
 import re
 import shutil
 import tempfile
+import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -12,52 +14,82 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, flash, redirect, render_template_string, request, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, send_file, url_for, flash
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ChunkedEncodingError, ConnectionError, HTTPError, RequestException, Timeout
+from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-# =========================
-# Configuración base
-# =========================
+# ── Constants ──────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".opdes"
 CONFIG_PATH = CONFIG_DIR / "config.json"
-
 DEFAULT_CONFIG = {
     "url": "https://onepace.net/es/watch",
     "output_dir": "",
     "metadata_dir": "",
     "quality": "max",
     "log_level": "error",
+    "jellyfin_url": "",
+    "jellyfin_token": "",
+    "jellyfin_user": "",
+    "jellyfin_series": "One Piece",
 }
-
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 API_HOSTS = ["pixeldrain.net", "pixeldrain.com"]
 CHUNK_SIZE = 1024 * 1024
 MAX_REINTENTOS_DESCARGA = 8
 MAX_REINTENTOS_JSON = 8
-LOG_LEVELS = {"error": 0, "debug": 1}
 METADATA_REPO_ZIP_URL = "https://github.com/4fr0-d3v/OPDES/archive/refs/heads/main.zip"
 METADATA_SOURCE_SUFFIX = "one-pace-jellyfin-master/One Pace"
+VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov"}
 
 app = Flask(__name__)
 app.secret_key = "opdes-local-dev"
 
-# =========================
-# Helpers de configuración
-# =========================
+# ── Job tracking ───────────────────────────────────────────────────────────────
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+
+def job_create(job_id: str, label: str) -> None:
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "label": label, "progress": 0, "total": 0, "msg": ""}
+
+
+def job_update(job_id: str, **kw) -> None:
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(kw)
+
+
+def jobs_snapshot() -> dict:
+    with _jobs_lock:
+        return {k: dict(v) for k, v in _jobs.items()}
+
+
+def jobs_clear_done() -> None:
+    with _jobs_lock:
+        done = [k for k, v in _jobs.items() if v["status"] in ("done", "error")]
+        for k in done:
+            del _jobs[k]
+
+
+# ── Catalog cache ──────────────────────────────────────────────────────────────
+_catalog_cache: dict = {"data": None, "ts": 0.0}
+CATALOG_TTL = 3600.0
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
 def cargar_config() -> dict:
     if not CONFIG_PATH.exists():
         guardar_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
-
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         guardar_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
-
     config = DEFAULT_CONFIG.copy()
     config.update(data)
     return config
@@ -69,59 +101,42 @@ def guardar_config(config: dict) -> None:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
-def config_basica_valida(config: dict) -> tuple[bool, list[str]]:
-    errores: list[str] = []
-
-    output_dir = Path(str(config.get("output_dir", "")).strip()).expanduser() if str(config.get("output_dir", "")).strip() else None
-    metadata_dir = Path(str(config.get("metadata_dir", "")).strip()).expanduser() if str(config.get("metadata_dir", "")).strip() else None
-
-    if output_dir is None:
-        errores.append("Falta configurar el directorio raíz de salida.")
-    else:
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            errores.append(f"No se puede usar output_dir: {e}")
-
-    if metadata_dir is None:
-        errores.append("Falta configurar el directorio de metadatos.")
-    elif not metadata_dir.exists():
-        errores.append("El directorio de metadatos no existe todavía. Sincroniza los metadatos.")
-    else:
-        seasons = list(metadata_dir.glob("Season *"))
-        if not seasons:
-            errores.append("El directorio de metadatos no contiene carpetas Season *.")
-
-    return (len(errores) == 0, errores)
+def config_completa(config: dict) -> bool:
+    return bool(
+        str(config.get("output_dir", "")).strip()
+        and str(config.get("metadata_dir", "")).strip()
+    )
 
 
-# =========================
-# Logging
-# =========================
-def get_log_level(config: dict | None = None) -> str:
-    if config is None:
-        config = cargar_config()
-    level = str(config.get("log_level", "error")).lower()
-    return level if level in LOG_LEVELS else "error"
+def metadatos_ok(config: dict) -> bool:
+    md = str(config.get("metadata_dir", "")).strip()
+    if not md:
+        return False
+    p = Path(md).expanduser()
+    return p.exists() and bool(list(p.glob("Season *")))
 
 
-def should_log(level: str, config: dict | None = None) -> bool:
-    current = get_log_level(config)
-    return LOG_LEVELS.get(current, 0) >= LOG_LEVELS.get(level, 0)
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def slugify(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^\w\-\.]+", "_", value)
+    value = re.sub(r"_+", "_", value)
+    return value.strip("_") or "sin_nombre"
 
 
-def log_debug(msg: str, config: dict | None = None) -> None:
-    if should_log("debug", config):
-        print(f"[debug] {msg}")
+def copiar_contenido_directorio(origen: Path, destino: Path) -> None:
+    destino.mkdir(parents=True, exist_ok=True)
+    for item in origen.iterdir():
+        dest_item = destino / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest_item, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest_item)
 
 
-def log_error(msg: str) -> None:
-    print(f"[error] {msg}")
+# ── Network ────────────────────────────────────────────────────────────────────
 
-
-# =========================
-# Red / Pixeldrain / One Pace
-# =========================
 def obtener_html(url: str) -> str:
     ultimo_error = None
     for intento in range(1, 6):
@@ -140,21 +155,14 @@ def obtener_html(url: str) -> str:
 def extraer_temporadas_y_pixeldrain(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     temporadas = []
-
     for li in soup.find_all("li", id=True):
         season_id = li["id"]
         pixeldrain_links = []
-
         for a in li.find_all("a", href=True):
             href = a["href"].strip()
             if "pixeldrain.net" in href or "pixeldrain.com" in href:
-                pixeldrain_links.append({
-                    "texto": a.get_text(separator=" ", strip=True),
-                    "url": href,
-                })
-
+                pixeldrain_links.append({"texto": a.get_text(separator=" ", strip=True), "url": href})
         temporadas.append({"id": season_id, "pixeldrain": pixeldrain_links})
-
     return temporadas
 
 
@@ -164,25 +172,17 @@ def extraer_calidad_desde_texto(texto: str) -> str | None:
 
 
 def ordenar_calidades(calidad: str) -> int:
-    orden = {"480p": 480, "720p": 720, "1080p": 1080}
-    return orden.get(calidad.lower(), 0)
+    return {"480p": 480, "720p": 720, "1080p": 1080}.get(calidad.lower(), 0)
 
 
 def agrupar_por_temporada(items: list[dict]) -> list[dict]:
     agrupado: dict[str, dict] = {}
-
     for item in items:
         arc_id = item.get("id", "sin_id")
         bucket = agrupado.setdefault(arc_id, {"id": arc_id, "opciones": []})
-
         for enlace in item.get("pixeldrain", []):
             calidad = extraer_calidad_desde_texto(enlace.get("texto", "")) or "desconocida"
-            bucket["opciones"].append({
-                "texto": enlace.get("texto", ""),
-                "url": enlace.get("url", ""),
-                "quality": calidad,
-            })
-
+            bucket["opciones"].append({"texto": enlace.get("texto", ""), "url": enlace.get("url", ""), "quality": calidad})
     resultado = list(agrupado.values())
     for idx, arc in enumerate(resultado, start=1):
         arc["season_number"] = idx
@@ -192,34 +192,28 @@ def agrupar_por_temporada(items: list[dict]) -> list[dict]:
 def elegir_opcion_por_calidad(opciones: list[dict], quality_config: str) -> dict | None:
     if not opciones:
         return None
-
-    opciones_validas = [x for x in opciones if x.get("quality") in {"480p", "720p", "1080p"}]
-    if not opciones_validas:
+    validas = [x for x in opciones if x.get("quality") in {"480p", "720p", "1080p"}]
+    if not validas:
         return opciones[0]
-
-    opciones_ordenadas = sorted(opciones_validas, key=lambda x: ordenar_calidades(x["quality"]))
+    ordenadas = sorted(validas, key=lambda x: ordenar_calidades(x["quality"]))
     if quality_config == "max":
-        return opciones_ordenadas[-1]
-
-    for op in opciones_ordenadas:
+        return ordenadas[-1]
+    for op in ordenadas:
         if op["quality"] == quality_config:
             return op
-
-    return opciones_ordenadas[-1]
+    return ordenadas[-1]
 
 
 def extraer_tipo_e_id(url: str):
     parsed = urlparse(url)
     path = parsed.path.strip("/")
     partes = path.split("/")
-
     if len(partes) >= 2:
         tipo, item_id = partes[0], partes[1]
         if tipo == "l":
             return "list", item_id
         if tipo == "u":
             return "file", item_id
-
     raise ValueError(f"URL de Pixeldrain no soportada: {url}")
 
 
@@ -245,28 +239,22 @@ def crear_sesion():
 def pedir_json_resistente(path: str, url_original: str, max_intentos: int = MAX_REINTENTOS_JSON):
     ultimo_error = None
     hosts = hosts_preferidos_desde_url(url_original)
-
     for host in hosts:
         url = f"https://{host}/api{path}"
         for intento in range(1, max_intentos + 1):
             try:
                 with requests.get(
-                    url,
-                    timeout=(10, 30),
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Accept": "application/json",
-                        "Connection": "close",
-                    },
+                    url, timeout=(10, 30),
+                    headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Connection": "close"},
                 ) as resp:
                     if resp.status_code == 404:
-                        raise RuntimeError(f"No encontrado en Pixeldrain: {url}")
+                        raise RuntimeError(f"No encontrado: {url}")
                     if resp.status_code == 403:
                         try:
-                            detalle = resp.json()
+                            det = resp.json()
                         except Exception:
-                            detalle = {"message": "403 Forbidden"}
-                        raise RuntimeError(f"No se puede acceder a {url}: {detalle.get('message', '403 Forbidden')}")
+                            det = {"message": "403 Forbidden"}
+                        raise RuntimeError(f"Acceso denegado: {det.get('message', '403')}")
                     resp.raise_for_status()
                     return resp.json()
             except (ConnectionError, Timeout, ChunkedEncodingError, OSError) as e:
@@ -277,41 +265,42 @@ def pedir_json_resistente(path: str, url_original: str, max_intentos: int = MAX_
             except HTTPError as e:
                 ultimo_error = e
                 break
+    raise RuntimeError(f"Falló la petición JSON: {ultimo_error}")
 
-    raise RuntimeError(f"Falló la petición JSON tras varios intentos: {ultimo_error}")
+
+def obtener_archivos_lista_pixeldrain(url: str) -> list[dict]:
+    tipo, item_id = extraer_tipo_e_id(url)
+    if tipo == "file":
+        info = pedir_json_resistente(f"/file/{item_id}/info", url)
+        return [info]
+    data = pedir_json_resistente(f"/list/{item_id}", url)
+    return data.get("files", [])
 
 
-# =========================
-# Metadatos
-# =========================
+# ── Metadata ───────────────────────────────────────────────────────────────────
+
 def sync_metadata(config: dict) -> None:
     metadata_dir = Path(config["metadata_dir"]).expanduser()
     metadata_dir.mkdir(parents=True, exist_ok=True)
-
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         zip_path = tmpdir_path / "repo.zip"
         extract_dir = tmpdir_path / "repo"
-
         with requests.get(METADATA_REPO_ZIP_URL, stream=True, timeout=120, headers=HEADERS) as resp:
             resp.raise_for_status()
             with open(zip_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
-
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(extract_dir)
-
         source_dir = None
         for candidate in extract_dir.rglob("One Pace"):
             if candidate.as_posix().endswith(METADATA_SOURCE_SUFFIX):
                 source_dir = candidate
                 break
-
         if source_dir is None or not source_dir.exists():
-            raise RuntimeError("No se encontró la carpeta de metadatos dentro del repositorio descargado.")
-
+            raise RuntimeError("No se encontró la carpeta de metadatos en el repositorio descargado.")
         copiar_contenido_directorio(source_dir, metadata_dir)
 
 
@@ -324,6 +313,24 @@ def leer_titulo_season_nfo(season_nfo: Path) -> str | None:
         return None
 
 
+def leer_episodio_nfo(ep_nfo: Path) -> dict:
+    result = {"title": ep_nfo.stem, "plot": "", "aired": ""}
+    try:
+        root = ET.parse(ep_nfo).getroot()
+        title = root.findtext("title")
+        if title:
+            result["title"] = title.strip()
+        plot = root.findtext("plot")
+        if plot:
+            result["plot"] = plot.strip()
+        aired = root.findtext("aired") or root.findtext("premiered")
+        if aired:
+            result["aired"] = aired.strip()
+    except Exception:
+        pass
+    return result
+
+
 def extraer_season_episode_de_nfo_name(nfo_name: str):
     m = re.search(r"S(\d+)E(\d+)", nfo_name, re.IGNORECASE)
     if not m:
@@ -331,23 +338,22 @@ def extraer_season_episode_de_nfo_name(nfo_name: str):
     return int(m.group(1)), int(m.group(2))
 
 
-def construir_indice_metadatos(metadata_root: Path):
+def construir_indice_metadatos(metadata_root: Path) -> dict:
     indice = {}
     if not metadata_root.exists():
         return indice
-
-    for season_dir in sorted(metadata_root.glob("Season *")):
+    for season_dir in sorted(
+        metadata_root.glob("Season *"),
+        key=lambda p: int(re.search(r"\d+", p.name).group()),
+    ):
         season_nfo = season_dir / "season.nfo"
         if not season_nfo.exists():
             continue
-
         num_match = re.search(r"Season\s+(\d+)", season_dir.name, re.IGNORECASE)
         if not num_match:
             continue
-
         season_number = int(num_match.group(1))
         season_title = leer_titulo_season_nfo(season_nfo) or season_dir.name
-
         episodes = {}
         for ep_nfo in sorted(season_dir.glob("*.nfo")):
             if ep_nfo.name.lower() == "season.nfo":
@@ -355,7 +361,6 @@ def construir_indice_metadatos(metadata_root: Path):
             _, ep_num = extraer_season_episode_de_nfo_name(ep_nfo.name)
             if ep_num is not None:
                 episodes[ep_num] = ep_nfo
-
         indice[season_number] = {
             "season_number": season_number,
             "season_title": season_title,
@@ -363,19 +368,22 @@ def construir_indice_metadatos(metadata_root: Path):
             "season_nfo": season_nfo,
             "episodes": episodes,
         }
-
     return indice
 
 
 def parsear_nombre_descargado(nombre_archivo: str):
-    patron = re.compile(r"^\[One Pace\]\[[^\]]+\]\s+(.+?)\s+(\d{2})\s+\[[^\]]+\]\[[^\]]+\]\[[0-9A-Fa-f]{8}\](\.[^.]+)$")
+    patron = re.compile(
+        r"^\[One Pace\]\[[^\]]+\]\s+(.+?)\s+(\d{2})\s+\[[^\]]+\]\[[^\]]+\]\[[0-9A-Fa-f]{8}\](\.[^.]+)$"
+    )
     m = patron.match(nombre_archivo)
     if not m:
         return None
     return {"arc_name": m.group(1).strip(), "episode_in_arc": int(m.group(2)), "ext": m.group(3)}
 
 
-def obtener_ruta_final_esperada(nombre_archivo: str, destino_base: Path, indice_metadatos: dict | None, season_number: int | None) -> Path | None:
+def obtener_ruta_final_esperada(
+    nombre_archivo: str, destino_base: Path, indice_metadatos: dict | None, season_number: int | None
+) -> Path | None:
     if not indice_metadatos or season_number is None:
         return None
     info = parsear_nombre_descargado(nombre_archivo)
@@ -391,7 +399,9 @@ def obtener_ruta_final_esperada(nombre_archivo: str, destino_base: Path, indice_
     return carpeta_temporada / f"{ep_nfo_src.stem}{Path(nombre_archivo).suffix}"
 
 
-def archivo_ya_existe_en_destino_final(nombre_archivo: str, destino_base: Path, indice_metadatos: dict | None, season_number: int | None) -> Path | None:
+def archivo_ya_existe_en_destino_final(
+    nombre_archivo: str, destino_base: Path, indice_metadatos: dict | None, season_number: int | None
+) -> Path | None:
     ruta_final = obtener_ruta_final_esperada(nombre_archivo, destino_base, indice_metadatos, season_number)
     if ruta_final and ruta_final.exists():
         return ruta_final
@@ -399,101 +409,128 @@ def archivo_ya_existe_en_destino_final(nombre_archivo: str, destino_base: Path, 
 
 
 def asegurar_estructura_temporada(destino_base: Path, season_meta: dict) -> Path:
-    season_number = season_meta["season_number"]
-    carpeta_temporada = destino_base / f"Season {season_number}"
+    carpeta_temporada = destino_base / f"Season {season_meta['season_number']}"
     carpeta_temporada.mkdir(parents=True, exist_ok=True)
-
     season_nfo_dest = carpeta_temporada / "season.nfo"
     if not season_nfo_dest.exists():
         shutil.copy2(season_meta["season_nfo"], season_nfo_dest)
-
-    poster_candidates = [
-        season_meta["season_dir"] / "poster.png",
-        season_meta["season_dir"] / "folder.jpg",
-        season_meta["season_dir"] / "folder.png",
-        season_meta["season_dir"] / "season.jpg",
-        season_meta["season_dir"] / "season.png",
-    ]
-    for poster_src in poster_candidates:
+    for poster_name in ["poster.png", "folder.jpg", "folder.png", "season.jpg", "season.png"]:
+        poster_src = season_meta["season_dir"] / poster_name
         if poster_src.exists():
             poster_dest = carpeta_temporada / poster_src.name
             if not poster_dest.exists():
                 shutil.copy2(poster_src, poster_dest)
             break
-
     return carpeta_temporada
 
 
-def renombrar_y_copiar_nfo_segun_metadata(video_path: Path, destino_base: Path, indice_metadatos: dict, season_number: int) -> Path:
+def renombrar_y_copiar_nfo_segun_metadata(
+    video_path: Path, destino_base: Path, indice_metadatos: dict, season_number: int
+) -> Path:
     info = parsear_nombre_descargado(video_path.name)
     if not info:
         return video_path
-
     season_meta = indice_metadatos.get(season_number)
     if not season_meta:
         return video_path
-
     ep_nfo_src = season_meta["episodes"].get(info["episode_in_arc"])
     if not ep_nfo_src:
         return video_path
-
     carpeta_temporada = asegurar_estructura_temporada(destino_base, season_meta)
     nuevo_stem = ep_nfo_src.stem
     nuevo_video = carpeta_temporada / f"{nuevo_stem}{video_path.suffix}"
     nuevo_nfo = carpeta_temporada / ep_nfo_src.name
-
     if video_path.resolve() != nuevo_video.resolve() and not nuevo_video.exists():
         shutil.move(str(video_path), str(nuevo_video))
-
     if not nuevo_nfo.exists():
         shutil.copy2(ep_nfo_src, nuevo_nfo)
-
     return nuevo_video
 
 
-# =========================
-# Descarga y borrado
-# =========================
-def descargar_archivo_reanudable(file_id: str, nombre_archivo: str, carpeta_destino: Path, session: requests.Session, url_original: str):
+# ── Local filesystem helpers ───────────────────────────────────────────────────
+
+def contar_locales(output_dir: Path, season_number: int) -> int:
+    carpeta = output_dir / f"Season {season_number}"
+    if not carpeta.exists():
+        return 0
+    return sum(1 for f in carpeta.iterdir() if f.suffix.lower() in VIDEO_EXTS)
+
+
+def episodio_descargado(output_dir: Path, season_number: int, episode_number: int) -> bool:
+    carpeta = output_dir / f"Season {season_number}"
+    if not carpeta.exists():
+        return False
+    patron = re.compile(rf"S{season_number:02d}E{episode_number:02d}", re.IGNORECASE)
+    return any(
+        patron.search(f.name) and f.suffix.lower() in VIDEO_EXTS
+        for f in carpeta.iterdir()
+    )
+
+
+def encontrar_archivo_local(output_dir: Path, season_number: int, episode_number: int) -> Path | None:
+    carpeta = output_dir / f"Season {season_number}"
+    if not carpeta.exists():
+        return None
+    patron = re.compile(rf"S{season_number:02d}E{episode_number:02d}", re.IGNORECASE)
+    for f in carpeta.iterdir():
+        if patron.search(f.name) and f.suffix.lower() in VIDEO_EXTS:
+            return f
+    return None
+
+
+def limpiar_temporales_si_ok(base_dir: Path) -> None:
+    tmp_dir = base_dir / "_tmp"
+    if tmp_dir.exists() and tmp_dir.is_dir():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    for ds_store in base_dir.rglob(".DS_Store"):
+        try:
+            ds_store.unlink()
+        except Exception:
+            pass
+
+
+# ── Download ───────────────────────────────────────────────────────────────────
+
+def descargar_archivo_reanudable(
+    file_id: str,
+    nombre_archivo: str,
+    carpeta_destino: Path,
+    session: requests.Session,
+    url_original: str,
+    progress_cb=None,
+):
     carpeta_destino.mkdir(parents=True, exist_ok=True)
     destino = carpeta_destino / nombre_archivo
     temp = destino.with_suffix(destino.suffix + ".part")
-
     if destino.exists():
         return destino
-
     ultimo_error = None
     hosts = hosts_preferidos_desde_url(url_original)
-
     for host in hosts:
         url_descarga = f"https://{host}/api/file/{file_id}?download"
-
         for intento in range(1, MAX_REINTENTOS_DESCARGA + 1):
             descargado = temp.stat().st_size if temp.exists() else 0
             headers = {"Connection": "close", "User-Agent": "Mozilla/5.0"}
             if descargado > 0:
                 headers["Range"] = f"bytes={descargado}-"
-
             try:
                 with session.get(url_descarga, headers=headers, stream=True, timeout=(10, 120)) as resp:
                     if resp.status_code == 403:
-                        raise RuntimeError(f"No se puede descargar {file_id}: 403 Forbidden")
+                        raise RuntimeError(f"403 Forbidden: {file_id}")
                     if resp.status_code == 404:
                         raise RuntimeError(f"Archivo no encontrado: {file_id}")
                     if resp.status_code not in (200, 206):
-                        raise RuntimeError(f"HTTP inesperado {resp.status_code} al descargar {file_id}")
-
+                        raise RuntimeError(f"HTTP {resp.status_code}")
                     modo = "ab" if resp.status_code == 206 and descargado > 0 else "wb"
                     if modo == "wb" and temp.exists():
                         temp.unlink()
                         descargado = 0
-
                     total = None
-                    content_length = resp.headers.get("Content-Length")
-                    if content_length and content_length.isdigit():
-                        total_respuesta = int(content_length)
-                        total = descargado + total_respuesta if resp.status_code == 206 else total_respuesta
-
+                    cl = resp.headers.get("Content-Length")
+                    if cl and cl.isdigit():
+                        total_resp = int(cl)
+                        total = descargado + total_resp if resp.status_code == 206 else total_resp
+                    bytes_escritos = descargado
                     with open(temp, modo) as f, tqdm(
                         total=total,
                         initial=descargado,
@@ -507,8 +544,10 @@ def descargar_archivo_reanudable(file_id: str, nombre_archivo: str, carpeta_dest
                         for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                             if chunk:
                                 f.write(chunk)
+                                bytes_escritos += len(chunk)
                                 pbar.update(len(chunk))
-
+                                if progress_cb and total:
+                                    progress_cb(bytes_escritos, total)
                 temp.rename(destino)
                 return destino
             except (ConnectionError, Timeout, ChunkedEncodingError, OSError) as e:
@@ -518,352 +557,838 @@ def descargar_archivo_reanudable(file_id: str, nombre_archivo: str, carpeta_dest
                 time.sleep(min(2 ** intento, 30))
             except RuntimeError:
                 raise
-
     raise RuntimeError(f"Fallo descargando {file_id}: {ultimo_error}")
 
 
-def procesar_url_pixeldrain(url: str, carpeta_base: Path, session: requests.Session, destino_base: Path, indice_metadatos: dict | None = None, season_number: int | None = None):
-    tipo, item_id = extraer_tipo_e_id(url)
-    descargados = []
+# ── Background jobs ────────────────────────────────────────────────────────────
 
-    if tipo == "file":
-        info = pedir_json_resistente(f"/file/{item_id}/info", url)
-        nombre = info.get("name") or f"{item_id}.bin"
-        ruta_final_existente = archivo_ya_existe_en_destino_final(nombre, destino_base, indice_metadatos, season_number)
-        if ruta_final_existente:
-            descargados.append(ruta_final_existente)
-            return descargados
-        ruta = descargar_archivo_reanudable(item_id, nombre, carpeta_base, session, url)
-        descargados.append(ruta)
+def _run_in_thread(job_id: str, fn, *args):
+    t = threading.Thread(target=fn, args=(job_id, *args), daemon=True)
+    t.start()
 
-    elif tipo == "list":
-        data = pedir_json_resistente(f"/list/{item_id}", url)
-        archivos = data.get("files", [])
-        for archivo in archivos:
+
+def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
+    output_dir = Path(config["output_dir"]).expanduser()
+    metadata_dir = Path(config["metadata_dir"]).expanduser()
+    indice_metadatos = construir_indice_metadatos(metadata_dir)
+    quality = config.get("quality", "max").lower()
+    opcion = elegir_opcion_por_calidad(arc.get("opciones", []), quality)
+    if not opcion:
+        job_update(job_id, status="error", msg="No hay enlaces disponibles.")
+        return
+    session = crear_sesion()
+    tmp_dir = output_dir / "_tmp" / slugify(arc["id"])
+    try:
+        archivos_pd = obtener_archivos_lista_pixeldrain(opcion["url"])
+        job_update(job_id, total=len(archivos_pd))
+    except Exception as e:
+        job_update(job_id, status="error", msg=str(e))
+        return
+    done = [0]
+    def on_file_done():
+        done[0] += 1
+        job_update(job_id, progress=done[0])
+    try:
+        rutas = []
+        tipo, item_id = extraer_tipo_e_id(opcion["url"])
+        for archivo in archivos_pd:
             file_id = archivo.get("id")
             if not file_id:
                 continue
             nombre = archivo.get("name") or f"{file_id}.bin"
-            ruta_final_existente = archivo_ya_existe_en_destino_final(nombre, destino_base, indice_metadatos, season_number)
-            if ruta_final_existente:
-                descargados.append(ruta_final_existente)
+            existente = archivo_ya_existe_en_destino_final(nombre, output_dir, indice_metadatos, arc["season_number"])
+            if existente:
+                rutas.append(existente)
+                on_file_done()
                 continue
-            ruta = descargar_archivo_reanudable(file_id, nombre, carpeta_base, session, url)
-            descargados.append(ruta)
+            ruta = descargar_archivo_reanudable(file_id, nombre, tmp_dir, session, opcion["url"])
+            rutas.append(ruta)
+            on_file_done()
+        rutas_finales = []
+        for ruta in rutas:
+            ruta_path = Path(ruta)
+            try:
+                ruta_path.relative_to(output_dir)
+                ya_final = ruta_path.parent.name.startswith("Season ")
+            except ValueError:
+                ya_final = False
+            if ya_final:
+                rutas_finales.append(ruta_path)
+            else:
+                rutas_finales.append(
+                    renombrar_y_copiar_nfo_segun_metadata(ruta_path, output_dir, indice_metadatos, arc["season_number"])
+                )
+        limpiar_temporales_si_ok(output_dir)
+        job_update(job_id, status="done", msg=f"Descargados {len(rutas_finales)} episodio(s).")
+    except Exception as e:
+        limpiar_temporales_si_ok(output_dir)
+        job_update(job_id, status="error", msg=str(e))
 
-    return descargados
 
-
-def obtener_archivos_descargados_para_temporada(url: str, destino_base: Path, indice_metadatos: dict, season_number: int) -> list[Path]:
-    archivos = obtener_archivos_lista_pixeldrain(url)
-    resultado = []
-    for archivo in archivos:
-        nombre = archivo.get("name") or f"{archivo.get('id', 'sin_id')}.bin"
-        ruta = obtener_ruta_final_esperada(nombre, destino_base, indice_metadatos, season_number)
-        if ruta and ruta.exists():
-            resultado.append(ruta)
-    return resultado
-
-
-def descargar_temporada(arc: dict, config: dict) -> tuple[bool, str]:
+def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: dict) -> None:
     output_dir = Path(config["output_dir"]).expanduser()
     metadata_dir = Path(config["metadata_dir"]).expanduser()
     indice_metadatos = construir_indice_metadatos(metadata_dir)
     quality = config.get("quality", "max").lower()
     opcion = elegir_opcion_por_calidad(arc.get("opciones", []), quality)
     if not opcion:
-        return False, "No hay enlaces disponibles para esta temporada."
-
+        job_update(job_id, status="error", msg="No hay enlaces disponibles.")
+        return
+    url = opcion["url"]
+    tipo, item_id = extraer_tipo_e_id(url)
+    try:
+        if tipo == "file":
+            info = pedir_json_resistente(f"/file/{item_id}/info", url)
+            file_id = item_id
+            pd_nombre = info.get("name") or f"{item_id}.bin"
+        else:
+            archivos = pedir_json_resistente(f"/list/{item_id}", url).get("files", [])
+            archivo_target = None
+            for archivo in archivos:
+                nombre = archivo.get("name") or ""
+                info = parsear_nombre_descargado(nombre)
+                if info and info["episode_in_arc"] == episode_number:
+                    archivo_target = archivo
+                    break
+            if not archivo_target:
+                job_update(job_id, status="error", msg=f"Episodio {episode_number} no encontrado en Pixeldrain.")
+                return
+            file_id = archivo_target["id"]
+            pd_nombre = archivo_target.get("name") or f"{file_id}.bin"
+    except Exception as e:
+        job_update(job_id, status="error", msg=str(e))
+        return
+    existente = archivo_ya_existe_en_destino_final(pd_nombre, output_dir, indice_metadatos, arc["season_number"])
+    if existente:
+        job_update(job_id, status="done", msg="Episodio ya descargado.")
+        return
     session = crear_sesion()
     tmp_dir = output_dir / "_tmp" / slugify(arc["id"])
 
-    rutas = procesar_url_pixeldrain(
-        url=opcion["url"],
-        carpeta_base=tmp_dir,
-        session=session,
-        destino_base=output_dir,
-        indice_metadatos=indice_metadatos,
-        season_number=arc["season_number"],
-    )
+    def progress_cb(downloaded: int, total_bytes: int):
+        job_update(job_id, progress=downloaded, total=total_bytes)
 
-    rutas_finales = []
-    for ruta in rutas:
-        ruta_path = Path(ruta)
-        try:
-            ruta_path.relative_to(output_dir)
-            ya_final = ruta_path.parent.name.startswith("Season ")
-        except ValueError:
-            ya_final = False
-
-        if ya_final:
-            rutas_finales.append(ruta_path)
-        else:
-            rutas_finales.append(
-                renombrar_y_copiar_nfo_segun_metadata(ruta_path, output_dir, indice_metadatos, arc["season_number"])
-            )
-
-    limpiar_temporales_si_ok(output_dir)
-    return True, f"Descargados {len(rutas_finales)} archivo(s)."
+    try:
+        ruta = descargar_archivo_reanudable(file_id, pd_nombre, tmp_dir, session, url, progress_cb)
+        renombrar_y_copiar_nfo_segun_metadata(ruta, output_dir, indice_metadatos, arc["season_number"])
+        limpiar_temporales_si_ok(output_dir)
+        job_update(job_id, status="done", msg=f"Episodio {episode_number} descargado.")
+    except Exception as e:
+        limpiar_temporales_si_ok(output_dir)
+        job_update(job_id, status="error", msg=str(e))
 
 
-def borrar_temporada(arc: dict, config: dict) -> tuple[bool, str]:
+# ── Catalog ────────────────────────────────────────────────────────────────────
+
+def cargar_catalogo(config: dict) -> list[dict]:
+    global _catalog_cache
+    now = time.time()
+    if _catalog_cache["data"] is not None and (now - _catalog_cache["ts"]) < CATALOG_TTL:
+        arcs_base = _catalog_cache["data"]
+    else:
+        html = obtener_html(config["url"])
+        temporadas = extraer_temporadas_y_pixeldrain(html)
+        arcs_base = agrupar_por_temporada(temporadas)
+        _catalog_cache = {"data": arcs_base, "ts": now}
+
     output_dir = Path(config["output_dir"]).expanduser()
     metadata_dir = Path(config["metadata_dir"]).expanduser()
     indice_metadatos = construir_indice_metadatos(metadata_dir)
     quality = config.get("quality", "max").lower()
-    opcion = elegir_opcion_por_calidad(arc.get("opciones", []), quality)
-    if not opcion:
-        return False, "No hay enlaces disponibles para resolver los archivos a borrar."
 
-    objetivos = obtener_archivos_descargados_para_temporada(opcion["url"], output_dir, indice_metadatos, arc["season_number"])
-    borrados = 0
-    for path in objetivos:
-        try:
-            path.unlink()
-            borrados += 1
-            nfo = path.with_suffix(".nfo")
-            if nfo.exists():
-                nfo.unlink()
-        except Exception:
-            pass
-
-    limpiar_temporales_si_ok(output_dir)
-    return True, f"Borrados {borrados} archivo(s)."
+    result = []
+    for arc in arcs_base:
+        a = dict(arc)
+        a["elegida"] = elegir_opcion_por_calidad(arc.get("opciones", []), quality)
+        a["descargados"] = contar_locales(output_dir, arc["season_number"])
+        season_meta = indice_metadatos.get(arc["season_number"])
+        a["total_meta"] = len(season_meta["episodes"]) if season_meta else None
+        a["season_title"] = season_meta["season_title"] if season_meta else arc["id"]
+        result.append(a)
+    return result
 
 
-def contar_descargados_para_enlace(item_id: str, url: str, output_dir: Path, season_number: int, indice_metadatos: dict | None = None):
-    try:
-        archivos = obtener_archivos_lista_pixeldrain(url)
-    except Exception:
-        return None, None
-
-    disponibles = 0
-    descargados = 0
-
-    for archivo in archivos:
-        file_id = archivo.get("id")
-        if not file_id:
-            continue
-        disponibles += 1
-
-        nombre = archivo.get("name") or f"{file_id}.bin"
-        encontrado = False
-        if indice_metadatos:
-            ruta = obtener_ruta_final_esperada(nombre, output_dir, indice_metadatos, season_number)
-            if ruta and ruta.exists():
-                encontrado = True
-        if not encontrado:
-            carpeta_item = output_dir / "_tmp" / slugify(item_id)
-            if (carpeta_item / nombre).exists():
-                encontrado = True
-        if encontrado:
-            descargados += 1
-
-    return descargados, disponibles
+def cargar_arc_por_numero(season_number: int, config: dict) -> dict | None:
+    catalogo = cargar_catalogo(config)
+    return next((x for x in catalogo if x["season_number"] == season_number), None)
 
 
-def obtener_archivos_lista_pixeldrain(url: str) -> list[dict]:
-    tipo, item_id = extraer_tipo_e_id(url)
-    if tipo == "file":
-        info = pedir_json_resistente(f"/file/{item_id}/info", url)
-        return [info]
-    data = pedir_json_resistente(f"/list/{item_id}", url)
-    return data.get("files", [])
+def cargar_detalle_temporada(season_number: int, config: dict) -> dict | None:
+    arc = cargar_arc_por_numero(season_number, config)
+    if not arc:
+        return None
+    output_dir = Path(config["output_dir"]).expanduser()
+    metadata_dir = Path(config["metadata_dir"]).expanduser()
+    indice_metadatos = construir_indice_metadatos(metadata_dir)
+    season_meta = indice_metadatos.get(season_number)
+    episodes = []
+    if season_meta:
+        for ep_num, ep_nfo in sorted(season_meta["episodes"].items()):
+            ep_info = leer_episodio_nfo(ep_nfo)
+            downloaded = episodio_descargado(output_dir, season_number, ep_num)
+            episodes.append({
+                "number": ep_num,
+                "title": ep_info["title"],
+                "plot": ep_info["plot"],
+                "aired": ep_info["aired"],
+                "downloaded": downloaded,
+                "available": arc.get("elegida") is not None,
+            })
+    return {"arc": arc, "season_meta": season_meta, "episodes": episodes}
 
 
-def limpiar_ds_store(base_dir: Path):
-    for ds_store in base_dir.rglob(".DS_Store"):
-        try:
-            ds_store.unlink()
-        except Exception:
-            pass
+# ── CSS / JS ───────────────────────────────────────────────────────────────────
 
+CSS = """
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;--border:#30363d;
+  --accent:#f6a200;--accent-dim:rgba(246,162,0,.15);
+  --text:#e6edf3;--muted:#8b949e;--success:#3fb950;--danger:#f85149;
+  --radius:12px;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+a{color:inherit;text-decoration:none}
 
-def limpiar_temporales_si_ok(base_dir: Path):
-    tmp_dir = base_dir / "_tmp"
-    if tmp_dir.exists() and tmp_dir.is_dir():
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    limpiar_ds_store(base_dir)
+/* Nav */
+.navbar{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:58px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;gap:16px}
+.nav-brand{font-size:1.1rem;font-weight:700;color:var(--accent);display:flex;align-items:center;gap:10px;white-space:nowrap}
+.nav-logo{height:30px;width:auto;border-radius:6px;object-fit:cover}
+.nav-links{display:flex;gap:4px}
+.nav-links a{padding:6px 14px;border-radius:8px;font-size:.875rem;color:var(--muted);transition:background .15s,color .15s}
+.nav-links a:hover{background:var(--surface2);color:var(--text)}
+.nav-links a.active{background:var(--accent-dim);color:var(--accent)}
 
+/* Flash */
+.flash-wrap{padding:12px 24px 0}
+.flash{display:flex;align-items:center;gap:10px;background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--radius);padding:12px 16px;font-size:.875rem;margin-bottom:8px}
+.flash.err{border-left-color:var(--danger)}
 
-# =========================
-# Presentación web
-# =========================
-BASE_TEMPLATE = """
-<!doctype html>
-<html lang=\"es\">
-<head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>OPDES Web</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 0; background: #0b1020; color: #eef2ff; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
-    .card { background: #141b34; border: 1px solid #263154; border-radius: 16px; padding: 18px; margin-bottom: 16px; }
-    input, select, button { border-radius: 10px; border: 1px solid #3a4a7a; padding: 10px 12px; }
-    input, select { width: 100%; background: #0f1630; color: #eef2ff; }
-    button { background: #4f7cff; color: white; cursor: pointer; }
-    button.danger { background: #c43d57; }
-    button.secondary { background: #29365f; }
-    .grid { display: grid; gap: 12px; }
-    .grid.two { grid-template-columns: 1fr 1fr; }
-    .muted { color: #b8c0e0; }
-    .flash { padding: 12px 14px; border-radius: 12px; margin-bottom: 12px; background: #243055; }
-    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    .badge { display:inline-block; padding: 4px 8px; border-radius: 999px; background:#243055; color:#d9e2ff; font-size: 12px; }
-    a { color: #8bb2ff; text-decoration: none; }
-    .topnav { display:flex; gap:12px; margin-bottom:20px; }
-  </style>
-</head>
-<body>
-<div class=\"wrap\">
-  <div class=\"topnav\">
-    <a href=\"{{ url_for('home') }}\">Inicio</a>
-    <a href=\"{{ url_for('setup') }}\">Configuración</a>
-    <a href=\"{{ url_for('sync_metadata_route') }}\">Sincronizar metadatos</a>
-  </div>
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% for category, message in messages %}
-      <div class=\"flash\">{{ message }}</div>
-    {% endfor %}
-  {% endfor %}
-  {{ content|safe }}
-</div>
-</body>
-</html>
+/* Main */
+.main{padding:32px 24px;max-width:1400px;margin:0 auto}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;border:none;cursor:pointer;font-size:.875rem;font-weight:500;transition:opacity .15s,transform .1s;white-space:nowrap}
+.btn:hover{opacity:.85}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:var(--accent);color:#000}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-ghost{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
+.btn-sm{padding:5px 12px;font-size:.8rem}
+.btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
+
+/* Forms */
+.form-group{margin-bottom:18px}
+.form-group label{display:block;margin-bottom:5px;font-size:.8rem;color:var(--muted);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+.form-group input,.form-group select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:.9rem;transition:border-color .15s}
+.form-group input:focus,.form-group select:focus{outline:none;border-color:var(--accent)}
+.form-hint{font-size:.75rem;color:var(--muted);margin-top:4px}
+.form-errors{background:rgba(248,81,73,.1);border:1px solid var(--danger);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:.875rem;color:var(--danger)}
+.form-errors li{margin-left:16px;margin-top:4px}
+
+/* Setup wizard */
+.wizard{max-width:600px;margin:60px auto}
+.wizard-hero{text-align:center;margin-bottom:40px}
+.wizard-hero h1{font-size:2rem;color:var(--accent);margin-bottom:8px}
+.wizard-hero p{color:var(--muted);font-size:.95rem}
+.wizard-logo{width:80px;height:80px;border-radius:16px;object-fit:cover;margin:0 auto 20px;display:block}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:28px}
+.card+.card{margin-top:16px}
+.card h2{font-size:1rem;margin-bottom:20px;display:flex;align-items:center;gap:10px}
+.card h2 .step-num{width:28px;height:28px;border-radius:50%;background:var(--accent);color:#000;font-size:.8rem;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.card h2 .step-num.done{background:var(--success)}
+.card h2 .step-num.locked{background:var(--surface2);color:var(--muted)}
+.card-footer{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
+.sync-info{background:var(--surface2);border-radius:8px;padding:12px 14px;font-size:.8rem;color:var(--muted);margin-bottom:16px;line-height:1.5}
+
+/* Catalog */
+.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;gap:16px;flex-wrap:wrap}
+.page-header h1{font-size:1.4rem;font-weight:700}
+.page-header .sub{color:var(--muted);font-size:.875rem}
+.season-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:18px}
+.season-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:transform .2s,border-color .2s;display:block;cursor:pointer}
+.season-card:hover{transform:translateY(-4px);border-color:var(--accent)}
+.season-card .poster-wrap{position:relative;aspect-ratio:2/3;background:var(--surface2);overflow:hidden}
+.season-card .poster-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.season-card .poster-wrap .no-poster{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:2.5rem;color:var(--muted)}
+.season-card .poster-wrap .status-dot{position:absolute;top:8px;right:8px;width:10px;height:10px;border-radius:50%;border:2px solid var(--surface)}
+.status-dot.full{background:var(--success)}
+.status-dot.partial{background:var(--accent)}
+.status-dot.none{background:var(--surface2)}
+.season-card .card-body{padding:10px 12px 12px}
+.season-card .card-num{font-size:.7rem;color:var(--muted);font-weight:600;margin-bottom:2px}
+.season-card .card-title{font-size:.82rem;font-weight:600;line-height:1.35;margin-bottom:6px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.season-card .prog-wrap{display:flex;align-items:center;gap:6px}
+.season-card .prog-bar{flex:1;height:3px;background:var(--surface2);border-radius:99px;overflow:hidden}
+.season-card .prog-bar .fill{height:100%;background:var(--accent);border-radius:99px}
+.season-card .prog-text{font-size:.7rem;color:var(--muted);white-space:nowrap}
+
+/* Season detail */
+.back-link{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:.875rem;margin-bottom:24px;transition:color .15s}
+.back-link:hover{color:var(--text)}
+.season-hero{display:flex;gap:28px;margin-bottom:32px}
+.season-hero .s-poster{width:180px;flex-shrink:0;border-radius:var(--radius);overflow:hidden;aspect-ratio:2/3;background:var(--surface2)}
+.season-hero .s-poster img{width:100%;height:100%;object-fit:cover;display:block}
+.season-hero .s-info{flex:1;min-width:0}
+.season-hero .s-num{font-size:.8rem;color:var(--muted);font-weight:600;margin-bottom:4px}
+.season-hero .s-title{font-size:1.6rem;font-weight:700;line-height:1.2;margin-bottom:12px}
+.season-hero .s-stats{display:flex;gap:20px;margin-bottom:20px;flex-wrap:wrap}
+.stat{display:flex;flex-direction:column;gap:2px}
+.stat .stat-val{font-size:1.2rem;font-weight:700}
+.stat .stat-lbl{font-size:.75rem;color:var(--muted)}
+.season-actions{display:flex;gap:10px;flex-wrap:wrap}
+
+/* Episode list */
+.ep-section-header{font-size:.8rem;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin:28px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.ep-list{display:flex;flex-direction:column;gap:8px}
+.ep-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;display:flex;align-items:center;gap:14px;padding:12px 16px;transition:border-color .15s}
+.ep-card:hover{border-color:var(--border);background:var(--surface2)}
+.ep-card.ep-downloaded{border-left:3px solid var(--success)}
+.ep-num{font-size:.9rem;font-weight:700;color:var(--muted);min-width:36px;text-align:center;flex-shrink:0}
+.ep-body{flex:1;min-width:0}
+.ep-title{font-size:.875rem;font-weight:600;margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ep-plot{font-size:.75rem;color:var(--muted);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.4}
+.ep-meta{font-size:.72rem;color:var(--muted);margin-top:4px}
+.ep-actions{flex-shrink:0;display:flex;align-items:center;gap:8px}
+.ep-badge{font-size:.7rem;font-weight:600;padding:3px 8px;border-radius:99px;white-space:nowrap}
+.ep-badge.ok{background:rgba(63,185,80,.15);color:var(--success)}
+.ep-badge.pending{background:var(--surface2);color:var(--muted)}
+.ep-badge.watched{background:rgba(246,162,0,.15);color:var(--accent);cursor:pointer}
+.ep-badge.unwatched{background:var(--surface2);color:var(--muted);cursor:pointer;opacity:.7}
+.no-av{font-size:.72rem;color:var(--muted);font-style:italic}
+
+/* Job bar */
+#job-bar{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--border);padding:10px 24px;z-index:200;display:none}
+#job-bar.visible{display:block}
+.job-row{display:flex;align-items:center;gap:12px;padding:4px 0}
+.job-lbl{font-size:.82rem;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.job-prog{width:100px;height:4px;background:var(--surface2);border-radius:99px;overflow:hidden;flex-shrink:0}
+.job-prog .fill{height:100%;background:var(--accent);border-radius:99px;transition:width .4s}
+.job-st{font-size:.75rem;color:var(--muted);min-width:40px;text-align:right;flex-shrink:0}
+.job-msg{font-size:.78rem;color:var(--success);padding:4px 0}
+.job-err{font-size:.78rem;color:var(--danger);padding:4px 0}
+
+/* Responsive */
+@media(max-width:640px){
+  .season-hero{flex-direction:column}
+  .season-hero .s-poster{width:120px}
+  .main{padding:20px 16px}
+  .navbar{padding:0 14px}
+  .ep-plot{display:none}
+  .season-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px}
+}
+"""
+
+JS = """
+let _hadRunning = false;
+function _fmtBytes(b){
+  if(!b)return '';
+  if(b>1e9)return (b/1e9).toFixed(1)+' GB';
+  if(b>1e6)return (b/1e6).toFixed(1)+' MB';
+  return (b/1e3).toFixed(0)+' KB';
+}
+function _pollJobs(){
+  fetch('/api/jobs').then(r=>r.json()).then(jobs=>{
+    const bar=document.getElementById('job-bar');
+    const cont=document.getElementById('job-items');
+    if(!bar||!cont)return;
+    const running=Object.entries(jobs).filter(([,v])=>v.status==='running');
+    const errors=Object.entries(jobs).filter(([,v])=>v.status==='error');
+    if(running.length>0){
+      _hadRunning=true;
+      bar.classList.add('visible');
+      cont.innerHTML=running.map(([id,j])=>{
+        const pct=j.total>0?Math.round(j.progress/j.total*100):0;
+        const sz=j.total>0?_fmtBytes(j.total):'';
+        return `<div class="job-row">
+          <span class="job-lbl">${j.label}</span>
+          <div class="job-prog"><div class="fill" style="width:${pct}%"></div></div>
+          <span class="job-st">${pct>0?pct+'%':'...'} ${sz?'/ '+sz:''}</span>
+        </div>`;
+      }).join('')+(errors.length?errors.map(([,j])=>`<div class="job-err">Error: ${j.msg}</div>`).join(''):'');
+    } else {
+      if(_hadRunning){
+        _hadRunning=false;
+        setTimeout(()=>location.reload(),800);
+      }
+      if(errors.length){
+        bar.classList.add('visible');
+        cont.innerHTML=errors.map(([,j])=>`<div class="job-err">Error: ${j.msg}</div>`).join('');
+      } else {
+        bar.classList.remove('visible');
+      }
+    }
+  }).catch(()=>{});
+  setTimeout(_pollJobs,2000);
+}
+document.addEventListener('DOMContentLoaded',()=>{
+  _pollJobs();
+});
 """
 
 
-def render_page(content: str, **ctx):
-    return render_template_string(BASE_TEMPLATE, content=content, **ctx)
+def render(template: str, **ctx) -> str:
+    return render_template_string(template, css=CSS, js=JS, **ctx)
 
 
-def cargar_catalogo(config: dict) -> list[dict]:
-    html = obtener_html(config["url"])
-    temporadas = extraer_temporadas_y_pixeldrain(html)
-    agrupadas = agrupar_por_temporada(temporadas)
+# ── Templates ──────────────────────────────────────────────────────────────────
 
-    output_dir = Path(config["output_dir"]).expanduser()
-    metadata_dir = Path(config["metadata_dir"]).expanduser()
-    indice_metadatos = construir_indice_metadatos(metadata_dir)
-    quality = config.get("quality", "max").lower()
-
-    for arc in agrupadas:
-        arc["elegida"] = elegir_opcion_por_calidad(arc.get("opciones", []), quality)
-        if arc["elegida"]:
-            descargados, total = contar_descargados_para_enlace(
-                arc["id"],
-                arc["elegida"]["url"],
-                output_dir,
-                arc["season_number"],
-                indice_metadatos,
-            )
-        else:
-            descargados, total = None, None
-        arc["descargados"] = descargados
-        arc["total"] = total
-    return agrupadas
-
-
-@app.before_request
-def exigir_setup():
-    if request.endpoint in {"setup", "save_setup", "static"}:
-        return
-    config = cargar_config()
-    ok, _ = config_basica_valida(config)
-    if not ok:
-        return redirect(url_for("setup"))
+LAYOUT = """<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}ONE PACE DES{% endblock %}</title>
+  <style>{{ css|safe }}</style>
+</head>
+<body>
+<nav class="navbar">
+  <a href="{{ url_for('home') }}" class="nav-brand">
+    <img class="nav-logo" src="{{ url_for('img_show_poster') }}" onerror="this.style.display='none'" alt="">
+    ONE PACE DES
+  </a>
+  <div class="nav-links">
+    <a href="{{ url_for('home') }}" {% if active=='home' %}class="active"{% endif %}>Biblioteca</a>
+    <a href="{{ url_for('setup') }}" {% if active=='setup' %}class="active"{% endif %}>Configuración</a>
+    <a href="{{ url_for('sync_metadata_route') }}" {% if active=='sync' %}class="active"{% endif %}>Sincronizar</a>
+  </div>
+</nav>
+{% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}
+<div class="flash-wrap">
+{% for cat, msg in msgs %}<div class="flash {% if cat=='error' %}err{% endif %}">{{ msg }}</div>{% endfor %}
+</div>{% endif %}{% endwith %}
+<div class="main">{{ content|safe }}</div>
+<div id="job-bar"><div id="job-items"></div></div>
+<script>{{ js|safe }}</script>
+</body>
+</html>"""
 
 
-@app.get("/")
-def home():
-    config = cargar_config()
-    ok, errores = config_basica_valida(config)
-    if not ok:
-        return redirect(url_for("setup"))
+def page(content: str, title: str = "ONE PACE DES", active: str = "") -> str:
+    return render(LAYOUT, content=content, active=active, page_title=title)
 
+
+# ── Jellyfin integration ───────────────────────────────────────────────────────
+
+_jf_user_cache: dict = {"id": None, "ts": 0.0}
+_jf_series_cache: dict = {"id": None, "ts": 0.0}
+_jf_seasons_cache: dict = {"data": None, "ts": 0.0}
+
+
+def _jf_headers(token: str) -> dict:
+    return {"X-Emby-Authorization": f'MediaBrowser Token="{token}"'}
+
+
+def jellyfin_get_user_id(config: dict) -> str | None:
+    now = time.time()
+    if _jf_user_cache["id"] and now - _jf_user_cache["ts"] < 300:
+        return _jf_user_cache["id"]
+    url = str(config.get("jellyfin_url", "")).rstrip("/")
+    token = str(config.get("jellyfin_token", "")).strip()
+    username = str(config.get("jellyfin_user", "")).strip().lower()
+    if not url or not token:
+        return None
     try:
-        catalogo = cargar_catalogo(config)
-    except Exception as e:
-        flash(f"Error cargando catálogo: {e}")
-        catalogo = []
+        resp = requests.get(f"{url}/Users", headers=_jf_headers(token), timeout=5)
+        resp.raise_for_status()
+        users = resp.json()
+        user_id = None
+        if username:
+            for u in users:
+                if u.get("Name", "").lower() == username:
+                    user_id = u["Id"]
+                    break
+        if not user_id:
+            for u in users:
+                if u.get("Policy", {}).get("IsAdministrator", False):
+                    user_id = u["Id"]
+                    break
+        if not user_id and users:
+            user_id = users[0]["Id"]
+        _jf_user_cache["id"] = user_id
+        _jf_user_cache["ts"] = now
+        return user_id
+    except Exception:
+        return None
 
-    cards = []
-    for arc in catalogo:
-        disponibles = ", ".join(sorted({x['quality'] for x in arc['opciones'] if x.get('quality') != 'desconocida'}, key=ordenar_calidades)) or "sin enlaces"
-        elegida = arc["elegida"]["quality"] if arc.get("elegida") else "ninguna"
-        estado = "-/-" if arc["descargados"] is None else f"{arc['descargados']}/{arc['total']}"
-        cards.append(f"""
-        <div class='card'>
-          <div class='row'><strong>{arc['season_number']}. {arc['id']}</strong>
-            <span class='badge'>disponible: {disponibles}</span>
-            <span class='badge'>elegida: {elegida}</span>
-            <span class='badge'>{estado}</span>
-          </div>
-          <div class='row' style='margin-top:12px;'>
-            <form method='post' action='{url_for('download_arc', season_number=arc['season_number'])}'>
-              <button type='submit'>Descargar</button>
-            </form>
-            <form method='post' action='{url_for('delete_arc', season_number=arc['season_number'])}'>
-              <button class='danger' type='submit'>Eliminar descargado</button>
-            </form>
-          </div>
-        </div>
-        """)
 
-    content = f"""
-    <div class='card'>
-      <h2>OPDES Web</h2>
-      <div class='muted'>Raíz de serie: {config['output_dir']}</div>
-      <div class='muted'>Metadatos: {config['metadata_dir']}</div>
-      <div class='muted'>URL: {config['url']}</div>
-      <div class='muted'>Calidad: {config['quality']}</div>
-    </div>
-    {''.join(cards) if cards else '<div class="card">No se pudo cargar el catálogo.</div>'}
-    """
-    return render_page(content)
+def jellyfin_get_series_id(config: dict) -> str | None:
+    now = time.time()
+    if _jf_series_cache["id"] and now - _jf_series_cache["ts"] < 3600:
+        return _jf_series_cache["id"]
+    url = str(config.get("jellyfin_url", "")).rstrip("/")
+    token = str(config.get("jellyfin_token", "")).strip()
+    series_name = str(config.get("jellyfin_series", "One Piece")).strip()
+    if not url or not token:
+        return None
+    try:
+        resp = requests.get(
+            f"{url}/Items",
+            params={"IncludeItemTypes": "Series", "Recursive": "true", "SearchTerm": series_name, "Fields": "Id,Name", "Limit": 10},
+            headers=_jf_headers(token),
+            timeout=5,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("Items", [])
+        series_id = None
+        for item in items:
+            if item.get("Name", "").lower() == series_name.lower():
+                series_id = item["Id"]
+                break
+        if not series_id and items:
+            series_id = items[0]["Id"]
+        _jf_series_cache["id"] = series_id
+        _jf_series_cache["ts"] = now
+        return series_id
+    except Exception:
+        return None
 
+
+def jellyfin_get_season_id(season: int, config: dict) -> str | None:
+    now = time.time()
+    if _jf_seasons_cache["data"] is not None and now - _jf_seasons_cache["ts"] < 3600:
+        return _jf_seasons_cache["data"].get(season)
+    url = str(config.get("jellyfin_url", "")).rstrip("/")
+    token = str(config.get("jellyfin_token", "")).strip()
+    if not url or not token:
+        return None
+    user_id = jellyfin_get_user_id(config)
+    series_id = jellyfin_get_series_id(config)
+    if not user_id or not series_id:
+        return None
+    try:
+        resp = requests.get(
+            f"{url}/Shows/{series_id}/Seasons",
+            params={"UserId": user_id, "Fields": "Id,IndexNumber"},
+            headers=_jf_headers(token),
+            timeout=5,
+        )
+        resp.raise_for_status()
+        mapping: dict[int, str] = {}
+        for item in resp.json().get("Items", []):
+            idx = item.get("IndexNumber")
+            if idx is not None:
+                mapping[idx] = item["Id"]
+        _jf_seasons_cache["data"] = mapping
+        _jf_seasons_cache["ts"] = now
+        return mapping.get(season)
+    except Exception:
+        return None
+
+
+def jellyfin_season_data(season: int, config: dict) -> dict[int, dict]:
+    url = str(config.get("jellyfin_url", "")).rstrip("/")
+    token = str(config.get("jellyfin_token", "")).strip()
+    if not url or not token:
+        return {}
+    user_id = jellyfin_get_user_id(config)
+    season_id = jellyfin_get_season_id(season, config)
+    if not user_id or not season_id:
+        return {}
+    try:
+        resp = requests.get(
+            f"{url}/Items",
+            params={
+                "ParentId": season_id,
+                "UserId": user_id,
+                "Fields": "Id,IndexNumber,UserData",
+                "IncludeItemTypes": "Episode",
+            },
+            headers=_jf_headers(token),
+            timeout=5,
+        )
+        resp.raise_for_status()
+        result = {}
+        for item in resp.json().get("Items", []):
+            ep_num = item.get("IndexNumber")
+            if ep_num is not None:
+                result[ep_num] = {
+                    "id": item["Id"],
+                    "played": item.get("UserData", {}).get("Played", False),
+                }
+        return result
+    except Exception:
+        return {}
+
+
+def jellyfin_find_episode(season: int, episode: int, config: dict) -> str | None:
+    ep_data = jellyfin_season_data(season, config).get(episode)
+    return ep_data["id"] if ep_data else None
+
+
+# ── Image routes ───────────────────────────────────────────────────────────────
+
+@app.get("/img/show/poster")
+def img_show_poster():
+    config = cargar_config()
+    md = str(config.get("metadata_dir", "")).strip()
+    if md:
+        p = Path(md).expanduser()
+        for name in ["poster.png", "poster-2.png", "poster.jpg"]:
+            f = p / name
+            if f.exists():
+                return send_file(f)
+    return ("", 404)
+
+
+@app.get("/img/show/backdrop")
+def img_show_backdrop():
+    config = cargar_config()
+    md = str(config.get("metadata_dir", "")).strip()
+    if md:
+        p = Path(md).expanduser()
+        for name in ["backdrop.jpg", "backdrop-2.jpg", "backdrop.png"]:
+            f = p / name
+            if f.exists():
+                return send_file(f)
+    return ("", 404)
+
+
+@app.get("/img/season/<int:n>/poster")
+def img_season_poster(n: int):
+    config = cargar_config()
+    md = str(config.get("metadata_dir", "")).strip()
+    if md:
+        season_dir = Path(md).expanduser() / f"Season {n}"
+        for name in ["poster.png", "folder.jpg", "folder.png"]:
+            f = season_dir / name
+            if f.exists():
+                return send_file(f)
+    return ("", 404)
+
+
+# ── API ────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/jobs")
+def api_jobs():
+    snap = jobs_snapshot()
+    return jsonify(snap)
+
+
+@app.post("/api/jobs/clear")
+def api_jobs_clear():
+    jobs_clear_done()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/jellyfin/debug/<int:season>")
+def jellyfin_debug(season: int):
+    config = cargar_config()
+    url = str(config.get("jellyfin_url", "")).rstrip("/")
+    token = str(config.get("jellyfin_token", "")).strip()
+    if not url or not token:
+        return jsonify({"error": "Jellyfin no configurado"})
+
+    user_id = jellyfin_get_user_id(config)
+    series_id = jellyfin_get_series_id(config)
+
+    out: dict = {
+        "user_id": user_id,
+        "series_id": series_id,
+        "seasons": [],
+        "episodes_for_season": [],
+    }
+
+    if series_id and user_id:
+        try:
+            r = requests.get(
+                f"{url}/Shows/{series_id}/Seasons",
+                params={"UserId": user_id, "Fields": "Id,IndexNumber,Name"},
+                headers=_jf_headers(token),
+                timeout=5,
+            )
+            out["seasons"] = [
+                {"index": i.get("IndexNumber"), "id": i.get("Id"), "name": i.get("Name")}
+                for i in r.json().get("Items", [])
+            ]
+        except Exception as e:
+            out["seasons_error"] = str(e)
+
+        season_id = jellyfin_get_season_id(season, config)
+        out["season_id_for_requested"] = season_id
+        if season_id:
+            try:
+                r2 = requests.get(
+                    f"{url}/Items",
+                    params={
+                        "ParentId": season_id,
+                        "UserId": user_id,
+                        "Fields": "Id,IndexNumber,UserData,Name",
+                        "IncludeItemTypes": "Episode",
+                    },
+                    headers=_jf_headers(token),
+                    timeout=5,
+                )
+                out["episodes_for_season"] = [
+                    {
+                        "index": i.get("IndexNumber"),
+                        "name": i.get("Name"),
+                        "played": i.get("UserData", {}).get("Played"),
+                    }
+                    for i in r2.json().get("Items", [])[:10]
+                ]
+                out["total_episodes"] = len(r2.json().get("Items", []))
+            except Exception as e:
+                out["episodes_error"] = str(e)
+
+    return jsonify(out)
+
+
+@app.get("/jellyfin/play/<int:season>/<int:episode>")
+def jellyfin_play(season: int, episode: int):
+    config = cargar_config()
+    jellyfin_url = str(config.get("jellyfin_url", "")).rstrip("/")
+    if not jellyfin_url:
+        flash("Configura la URL de Jellyfin en los ajustes.")
+        return redirect(url_for("setup"))
+    item_id = jellyfin_find_episode(season, episode, config)
+    if item_id:
+        return redirect(f"{jellyfin_url}/web/index.html#!/details?id={item_id}")
+    return redirect(f"{jellyfin_url}/web/index.html")
+
+
+@app.post("/jellyfin/watched/<int:season>/<int:episode>")
+def jellyfin_toggle_watched(season: int, episode: int):
+    config = cargar_config()
+    jellyfin_url = str(config.get("jellyfin_url", "")).rstrip("/")
+    token = str(config.get("jellyfin_token", "")).strip()
+    if not jellyfin_url or not token:
+        flash("Configura Jellyfin primero.")
+        return redirect(url_for("setup"))
+    user_id = jellyfin_get_user_id(config)
+    jf_data = jellyfin_season_data(season, config)
+    ep_data = jf_data.get(episode)
+    if not ep_data or not user_id:
+        flash(f"Episodio S{season:02d}E{episode:02d} no encontrado en Jellyfin.")
+        return redirect(url_for("season_detail", n=season))
+    item_id = ep_data["id"]
+    played = ep_data["played"]
+    headers = {"X-Emby-Authorization": f'MediaBrowser Token="{token}"'}
+    try:
+        if played:
+            requests.delete(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
+        else:
+            requests.post(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
+    except Exception:
+        flash("Error al actualizar el estado en Jellyfin.")
+    return redirect(url_for("season_detail", n=season))
+
+
+# ── Setup ──────────────────────────────────────────────────────────────────────
 
 @app.get("/setup")
 def setup():
     config = cargar_config()
-    _, errores = config_basica_valida(config)
-    errores_html = "".join([f"<li>{e}</li>" for e in errores])
-    content = f"""
-    <div class='card'>
-      <h2>Configuración inicial</h2>
-      <p class='muted'>Antes de usar la aplicación, configura al menos la raíz de salida y el directorio de metadatos.</p>
-      {'<ul>' + errores_html + '</ul>' if errores else ''}
-      <form method='post' action='{url_for('save_setup')}' class='grid'>
-        <div>
-          <label>URL One Pace</label>
-          <input name='url' value='{config.get('url', '')}'>
-        </div>
-        <div>
-          <label>Raíz de la serie</label>
-          <input name='output_dir' value='{config.get('output_dir', '')}' placeholder='/media/Series/One Pace'>
-        </div>
-        <div>
-          <label>Directorio de metadatos</label>
-          <input name='metadata_dir' value='{config.get('metadata_dir', '')}' placeholder='/srv/opdes/metadatos'>
-        </div>
-        <div>
-          <label>Calidad</label>
-          <select name='quality'>
-            <option value='max' {'selected' if config.get('quality') == 'max' else ''}>max</option>
-            <option value='480p' {'selected' if config.get('quality') == '480p' else ''}>480p</option>
-            <option value='720p' {'selected' if config.get('quality') == '720p' else ''}>720p</option>
-            <option value='1080p' {'selected' if config.get('quality') == '1080p' else ''}>1080p</option>
-          </select>
-        </div>
-        <div class='row'>
-          <button type='submit'>Guardar configuración</button>
-          <a href='{url_for('sync_metadata_route')}'>Sincronizar metadatos</a>
-        </div>
-      </form>
+    cfg_ok = config_completa(config)
+    meta_ok = metadatos_ok(config)
+
+    step1_done = cfg_ok
+    step2_done = meta_ok
+
+    html = """
+<div class="wizard">
+  <div class="wizard-hero">
+    <img class="wizard-logo" src="/img/show/poster" onerror="this.style.display='none'" alt="">
+    <h1>OPDES Web</h1>
+    <p>Descargador de One Pace para Jellyfin</p>
+  </div>
+"""
+
+    # Step 1 – Directorios
+    step1_num = '<span class="step-num done">✓</span>' if step1_done else '<span class="step-num">1</span>'
+    errors_cfg = []
+    if not str(config.get("output_dir", "")).strip():
+        errors_cfg.append("Falta la carpeta de episodios.")
+    if not str(config.get("metadata_dir", "")).strip():
+        errors_cfg.append("Falta la carpeta de metadatos.")
+    errors_html = ""
+    if errors_cfg and not step1_done:
+        errors_html = '<div class="form-errors"><ul>' + "".join(f"<li>{e}</li>" for e in errors_cfg) + "</ul></div>"
+
+    q = config.get("quality", "max")
+    opts = "".join(
+        f'<option value="{v}" {"selected" if q == v else ""}>{v}</option>'
+        for v in ["max", "1080p", "720p", "480p"]
+    )
+
+    html += f"""
+  <div class="card">
+    <h2>{step1_num} Directorios y calidad</h2>
+    {errors_html}
+    <form method="post" action="/setup">
+      <div class="form-group">
+        <label>Carpeta de episodios</label>
+        <input name="output_dir" value="{config.get('output_dir','')}" placeholder="/media/Series/One Pace">
+        <div class="form-hint">Aquí se guardarán los vídeos descargados.</div>
+      </div>
+      <div class="form-group">
+        <label>Carpeta de metadatos</label>
+        <input name="metadata_dir" value="{config.get('metadata_dir','')}" placeholder="/srv/opdes/metadatos">
+        <div class="form-hint">NFOs, pósters y carátulas de temporadas y episodios.</div>
+      </div>
+      <div class="form-group">
+        <label>URL One Pace</label>
+        <input name="url" value="{config.get('url',DEFAULT_CONFIG['url'])}">
+      </div>
+      <div class="form-group">
+        <label>Calidad preferida</label>
+        <select name="quality">{opts}</select>
+      </div>
+      <div class="form-group">
+        <label>URL de Jellyfin</label>
+        <input name="jellyfin_url" value="{config.get('jellyfin_url','')}" placeholder="http://192.168.1.204:8096">
+        <div class="form-hint">Para el botón de reproducción directa desde los episodios.</div>
+      </div>
+      <div class="form-group">
+        <label>API Token de Jellyfin</label>
+        <input name="jellyfin_token" value="{config.get('jellyfin_token','')}" placeholder="Token de API de Jellyfin">
+        <div class="form-hint">Dashboard → API Keys → Nueva clave.</div>
+      </div>
+      <div class="form-group">
+        <label>Usuario de Jellyfin</label>
+        <input name="jellyfin_user" value="{config.get('jellyfin_user','')}" placeholder="kilian">
+        <div class="form-hint">Nombre de usuario para el estado de visto. Vacío usa el primer administrador.</div>
+      </div>
+      <div class="form-group">
+        <label>Nombre de la serie en Jellyfin</label>
+        <input name="jellyfin_series" value="{config.get('jellyfin_series', DEFAULT_CONFIG['jellyfin_series'])}">
+        <div class="form-hint">Nombre exacto de la serie tal como aparece en Jellyfin.</div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary" type="submit">Guardar configuración</button>
+      </div>
+    </form>
+  </div>
+"""
+
+    # Step 2 – Metadatos
+    if step1_done:
+        step2_num = '<span class="step-num done">✓</span>' if step2_done else '<span class="step-num">2</span>'
+        sync_btn = '<a class="btn btn-primary" href="/sync-metadata">Descargar metadatos</a>'
+        if step2_done:
+            sync_btn = '<a class="btn btn-ghost" href="/sync-metadata">Actualizar metadatos</a>'
+        html += f"""
+  <div class="card">
+    <h2>{step2_num} Metadatos de One Pace</h2>
+    <div class="sync-info">
+      Los metadatos incluyen carátulas de temporadas, pósters y fichas NFO de cada episodio para Jellyfin.
+      Se descargan desde el repositorio GitHub de OPDES. Solo necesitas hacer esto una vez
+      (o cuando quieras actualizarlos).
     </div>
-    """
-    return render_page(content)
+    <div class="card-footer">
+      {sync_btn}
+      {"<span style='color:var(--success);font-size:.875rem'>✓ Metadatos listos</span>" if step2_done else ""}
+    </div>
+  </div>
+"""
+        if step2_done:
+            html += """
+  <div class="card-footer" style="margin-top:16px">
+    <a class="btn btn-primary" href="/">Ir a la biblioteca</a>
+  </div>
+"""
+    html += "</div>"
+    return page(html, title="Configuración", active="setup")
 
 
 @app.post("/setup")
@@ -873,6 +1398,13 @@ def save_setup():
     config["output_dir"] = request.form.get("output_dir", "").strip()
     config["metadata_dir"] = request.form.get("metadata_dir", "").strip()
     config["quality"] = request.form.get("quality", "max").strip().lower() or "max"
+    config["jellyfin_url"] = request.form.get("jellyfin_url", "").strip().rstrip("/")
+    config["jellyfin_token"] = request.form.get("jellyfin_token", "").strip()
+    config["jellyfin_user"] = request.form.get("jellyfin_user", "").strip()
+    config["jellyfin_series"] = request.form.get("jellyfin_series", DEFAULT_CONFIG["jellyfin_series"]).strip() or DEFAULT_CONFIG["jellyfin_series"]
+    _jf_user_cache["id"] = None
+    _jf_series_cache["id"] = None
+    _jf_seasons_cache["data"] = None
     guardar_config(config)
     flash("Configuración guardada.")
     return redirect(url_for("setup"))
@@ -884,47 +1416,283 @@ def sync_metadata_route():
     if not str(config.get("metadata_dir", "")).strip():
         flash("Define primero el directorio de metadatos.")
         return redirect(url_for("setup"))
-
     try:
         sync_metadata(config)
         flash("Metadatos sincronizados correctamente.")
     except Exception as e:
         flash(f"Error sincronizando metadatos: {e}")
-    return redirect(url_for("home"))
+    return redirect(url_for("setup"))
 
 
-@app.post("/download/<int:season_number>")
-def download_arc(season_number: int):
+# ── Home / Catalog ─────────────────────────────────────────────────────────────
+
+@app.before_request
+def check_setup():
+    if request.endpoint in {"setup", "save_setup", "sync_metadata_route", "img_show_poster",
+                             "img_show_backdrop", "img_season_poster", "api_jobs", "api_jobs_clear", "static"}:
+        return
     config = cargar_config()
-    catalogo = cargar_catalogo(config)
-    arc = next((x for x in catalogo if x["season_number"] == season_number), None)
-    if not arc:
+    if not config_completa(config):
+        return redirect(url_for("setup"))
+    if not metadatos_ok(config):
+        flash("Sincroniza los metadatos antes de continuar.")
+        return redirect(url_for("setup"))
+
+
+@app.get("/")
+def home():
+    config = cargar_config()
+    try:
+        catalogo = cargar_catalogo(config)
+    except Exception as e:
+        flash(f"Error cargando el catálogo: {e}")
+        catalogo = []
+
+    total_seasons = len(catalogo)
+    total_dl = sum(a.get("descargados", 0) or 0 for a in catalogo)
+    total_ep = sum(a.get("total_meta", 0) or 0 for a in catalogo)
+
+    cards = []
+    for arc in catalogo:
+        n = arc["season_number"]
+        title = arc.get("season_title") or arc["id"]
+        dl = arc.get("descargados") or 0
+        total = arc.get("total_meta") or 0
+        pct = int(dl / total * 100) if total else 0
+        if dl == 0:
+            dot = "none"
+        elif dl >= total:
+            dot = "full"
+        else:
+            dot = "partial"
+        prog_text = f"{dl}/{total}" if total else "—"
+        cards.append(f"""
+<a class="season-card" href="/season/{n}">
+  <div class="poster-wrap">
+    <img src="/img/season/{n}/poster" alt="" onerror="this.parentNode.innerHTML='<div class=no-poster>🏴‍☠️</div>'">
+    <span class="status-dot {dot}"></span>
+  </div>
+  <div class="card-body">
+    <div class="card-num">Temporada {n}</div>
+    <div class="card-title">{title}</div>
+    <div class="prog-wrap">
+      <div class="prog-bar"><div class="fill" style="width:{pct}%"></div></div>
+      <span class="prog-text">{prog_text}</span>
+    </div>
+  </div>
+</a>""")
+
+    cards_html = "\n".join(cards) if cards else '<p style="color:var(--muted)">No se pudo cargar el catálogo.</p>'
+
+    content = f"""
+<div class="page-header">
+  <div>
+    <h1>One Pace</h1>
+    <div class="sub">{total_seasons} temporadas &nbsp;·&nbsp; {total_dl}/{total_ep} episodios descargados</div>
+  </div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap">
+    <a class="btn btn-ghost btn-sm" href="/setup">Configuración</a>
+    <a class="btn btn-ghost btn-sm" href="/sync-metadata">Sincronizar metadatos</a>
+  </div>
+</div>
+<div class="season-grid">{cards_html}</div>
+"""
+    return page(content, title="Biblioteca", active="home")
+
+
+# ── Season detail ──────────────────────────────────────────────────────────────
+
+@app.get("/season/<int:n>")
+def season_detail(n: int):
+    config = cargar_config()
+    try:
+        detalle = cargar_detalle_temporada(n, config)
+    except Exception as e:
+        flash(f"Error cargando temporada: {e}")
+        return redirect(url_for("home"))
+    if not detalle:
         flash("Temporada no encontrada.")
         return redirect(url_for("home"))
 
-    try:
-        ok, msg = descargar_temporada(arc, config)
-        flash(msg)
-    except Exception as e:
-        flash(f"Error descargando: {e}")
-    return redirect(url_for("home"))
+    arc = detalle["arc"]
+    episodes = detalle["episodes"]
+    season_meta = detalle["season_meta"]
+
+    title = arc.get("season_title") or arc["id"]
+    dl_count = sum(1 for e in episodes if e["downloaded"])
+    total_ep = len(episodes)
+    has_link = arc.get("elegida") is not None
+    quality = arc["elegida"]["quality"] if has_link else "—"
+
+    qualities_available = ", ".join(
+        sorted({x["quality"] for x in arc.get("opciones", []) if x.get("quality") != "desconocida"}, key=ordenar_calidades)
+    ) or "sin enlaces"
+
+    jellyfin_url = str(config.get("jellyfin_url", "")).strip()
+    jf_data = jellyfin_season_data(n, config) if jellyfin_url else {}
+
+    # Season hero
+    dl_all_btn = ""
+    del_all_btn = ""
+    if has_link:
+        dl_all_btn = f'<form method="post" action="/download/season/{n}" style="display:inline"><button class="btn btn-primary" type="submit">⬇ Descargar todo</button></form>'
+    if dl_count > 0:
+        del_all_btn = f'<form method="post" action="/delete/season/{n}" style="display:inline" onsubmit="return confirm(\'¿Eliminar los {dl_count} episodios descargados?\')"><button class="btn btn-danger" type="submit">🗑 Eliminar todo</button></form>'
+
+    job_id_season = f"season-{n}"
+    jobs = jobs_snapshot()
+    season_downloading = job_id_season in jobs and jobs[job_id_season]["status"] == "running"
+
+    content = f"""
+<a class="back-link" href="/">← Biblioteca</a>
+<div class="season-hero">
+  <div class="s-poster">
+    <img src="/img/season/{n}/poster" alt="" onerror="this.style.display='none'">
+  </div>
+  <div class="s-info">
+    <div class="s-num">Temporada {n}</div>
+    <div class="s-title">{title}</div>
+    <div class="s-stats">
+      <div class="stat"><span class="stat-val">{total_ep}</span><span class="stat-lbl">Episodios totales</span></div>
+      <div class="stat"><span class="stat-val" style="color:var(--success)">{dl_count}</span><span class="stat-lbl">Descargados</span></div>
+      <div class="stat"><span class="stat-val">{quality}</span><span class="stat-lbl">Calidad elegida</span></div>
+      <div class="stat"><span class="stat-val" style="font-size:.9rem">{qualities_available}</span><span class="stat-lbl">Disponible en</span></div>
+    </div>
+    <div class="season-actions">
+      {"<span style='color:var(--accent);font-size:.875rem'>⏳ Descargando...</span>" if season_downloading else dl_all_btn}
+      {del_all_btn}
+    </div>
+  </div>
+</div>
+<div class="ep-section-header">Episodios</div>
+<div class="ep-list">
+{"<p style='color:var(--muted);font-size:.875rem;padding:16px 0'>No hay metadatos disponibles para esta temporada. Sincroniza los metadatos.</p>" if not episodes else ""}
+"""
+
+    for ep in episodes:
+        en = ep["number"]
+        et = ep["title"]
+        ep_plot = ep["plot"][:160] + ("…" if len(ep["plot"]) > 160 else "") if ep["plot"] else ""
+        ep_aired = ep["aired"] if ep["aired"] else ""
+        downloaded = ep["downloaded"]
+        available = ep["available"]
+
+        ep_job_id = f"ep-{n}-{en}"
+        ep_downloading = ep_job_id in jobs and jobs[ep_job_id]["status"] == "running"
+
+        badge = '<span class="ep-badge ok">✓ Descargado</span>' if downloaded else '<span class="ep-badge pending">Sin descargar</span>'
+
+        jf_ep = jf_data.get(en)
+        watched_badge = ""
+        if downloaded and jf_ep:
+            if jf_ep["played"]:
+                watched_badge = f'<form method="post" action="/jellyfin/watched/{n}/{en}" style="display:inline"><button class="ep-badge watched" type="submit" title="Marcar como no visto">✓ Visto</button></form>'
+            else:
+                watched_badge = f'<form method="post" action="/jellyfin/watched/{n}/{en}" style="display:inline"><button class="ep-badge unwatched" type="submit" title="Marcar como visto">○ No visto</button></form>'
+
+        if ep_downloading:
+            action = "<span style='color:var(--accent);font-size:.75rem'>⏳ Descargando…</span>"
+        elif downloaded:
+            play_btn = f'<a class="btn btn-primary btn-sm" href="/jellyfin/play/{n}/{en}" title="Ver en Jellyfin">▶</a>' if jellyfin_url else ""
+            del_btn = f'<form method="post" action="/delete/season/{n}/episode/{en}" onsubmit="return confirm(\'¿Eliminar episodio {en}?\')"><button class="btn btn-danger btn-sm" type="submit">🗑</button></form>'
+            action = f'<div style="display:flex;gap:6px;align-items:center">{play_btn}{del_btn}</div>'
+        elif available:
+            action = f'<form method="post" action="/download/season/{n}/episode/{en}"><button class="btn btn-primary btn-sm" type="submit">⬇</button></form>'
+        else:
+            action = '<span class="no-av">No disponible</span>'
+
+        meta_parts = []
+        if ep_aired:
+            meta_parts.append(ep_aired)
+        meta_str = " · ".join(meta_parts)
+
+        content += f"""
+  <div class="ep-card {"ep-downloaded" if downloaded else ""}">
+    <div class="ep-num">E{en:02d}</div>
+    <div class="ep-body">
+      <div class="ep-title">{et}</div>
+      {"<div class='ep-plot'>" + ep_plot + "</div>" if ep_plot else ""}
+      {"<div class='ep-meta'>" + meta_str + "</div>" if meta_str else ""}
+    </div>
+    <div class="ep-actions">{badge}{watched_badge}{action}</div>
+  </div>"""
+
+    content += "\n</div>"
+    return page(content, title=f"T{n}: {title}", active="home")
 
 
-@app.post("/delete/<int:season_number>")
-def delete_arc(season_number: int):
+# ── Download / Delete actions ──────────────────────────────────────────────────
+
+@app.post("/download/season/<int:n>")
+def download_season(n: int):
     config = cargar_config()
-    catalogo = cargar_catalogo(config)
-    arc = next((x for x in catalogo if x["season_number"] == season_number), None)
+    arc = cargar_arc_por_numero(n, config)
     if not arc:
         flash("Temporada no encontrada.")
         return redirect(url_for("home"))
+    job_id = f"season-{n}"
+    jobs = jobs_snapshot()
+    if job_id in jobs and jobs[job_id]["status"] == "running":
+        flash("La temporada ya se está descargando.")
+        return redirect(url_for("season_detail", n=n))
+    job_create(job_id, f"T{n}: {arc.get('season_title', arc['id'])}")
+    _run_in_thread(job_id, descargar_temporada_bg, arc, config)
+    flash(f"Descarga de la temporada {n} iniciada en segundo plano.")
+    return redirect(url_for("season_detail", n=n))
 
-    try:
-        ok, msg = borrar_temporada(arc, config)
-        flash(msg)
-    except Exception as e:
-        flash(f"Error borrando: {e}")
-    return redirect(url_for("home"))
+
+@app.post("/download/season/<int:n>/episode/<int:e>")
+def download_episode(n: int, e: int):
+    config = cargar_config()
+    arc = cargar_arc_por_numero(n, config)
+    if not arc:
+        flash("Temporada no encontrada.")
+        return redirect(url_for("home"))
+    job_id = f"ep-{n}-{e}"
+    jobs = jobs_snapshot()
+    if job_id in jobs and jobs[job_id]["status"] == "running":
+        flash("El episodio ya se está descargando.")
+        return redirect(url_for("season_detail", n=n))
+    title = arc.get("season_title", arc["id"])
+    job_create(job_id, f"T{n} E{e:02d} — {title}")
+    _run_in_thread(job_id, descargar_episodio_bg, arc, e, config)
+    flash(f"Descarga del episodio {e} iniciada en segundo plano.")
+    return redirect(url_for("season_detail", n=n))
+
+
+@app.post("/delete/season/<int:n>")
+def delete_season(n: int):
+    config = cargar_config()
+    output_dir = Path(config["output_dir"]).expanduser()
+    carpeta = output_dir / f"Season {n}"
+    borrados = 0
+    if carpeta.exists():
+        for f in carpeta.iterdir():
+            if f.suffix.lower() in VIDEO_EXTS:
+                f.unlink()
+                borrados += 1
+                nfo = f.with_suffix(".nfo")
+                if nfo.exists():
+                    nfo.unlink()
+    limpiar_temporales_si_ok(output_dir)
+    flash(f"Eliminados {borrados} episodio(s) de la temporada {n}.")
+    return redirect(url_for("season_detail", n=n))
+
+
+@app.post("/delete/season/<int:n>/episode/<int:e>")
+def delete_episode(n: int, e: int):
+    config = cargar_config()
+    output_dir = Path(config["output_dir"]).expanduser()
+    f = encontrar_archivo_local(output_dir, n, e)
+    if f:
+        f.unlink()
+        nfo = f.with_suffix(".nfo")
+        if nfo.exists():
+            nfo.unlink()
+        flash(f"Episodio {e} eliminado.")
+    else:
+        flash(f"El episodio {e} no estaba descargado.")
+    return redirect(url_for("season_detail", n=n))
 
 
 if __name__ == "__main__":
