@@ -1171,69 +1171,6 @@ def api_jobs_clear():
     return jsonify({"ok": True})
 
 
-@app.get("/api/jellyfin/debug/<int:season>")
-def jellyfin_debug(season: int):
-    config = cargar_config()
-    url = str(config.get("jellyfin_url", "")).rstrip("/")
-    token = str(config.get("jellyfin_token", "")).strip()
-    if not url or not token:
-        return jsonify({"error": "Jellyfin no configurado"})
-
-    user_id = jellyfin_get_user_id(config)
-    series_id = jellyfin_get_series_id(config)
-
-    out: dict = {
-        "user_id": user_id,
-        "series_id": series_id,
-        "seasons": [],
-        "episodes_for_season": [],
-    }
-
-    if series_id and user_id:
-        try:
-            r = requests.get(
-                f"{url}/Shows/{series_id}/Seasons",
-                params={"UserId": user_id, "Fields": "Id,IndexNumber,Name"},
-                headers=_jf_headers(token),
-                timeout=5,
-            )
-            out["seasons"] = [
-                {"index": i.get("IndexNumber"), "id": i.get("Id"), "name": i.get("Name")}
-                for i in r.json().get("Items", [])
-            ]
-        except Exception as e:
-            out["seasons_error"] = str(e)
-
-        season_id = jellyfin_get_season_id(season, config)
-        out["season_id_for_requested"] = season_id
-        if season_id:
-            try:
-                r2 = requests.get(
-                    f"{url}/Items",
-                    params={
-                        "ParentId": season_id,
-                        "UserId": user_id,
-                        "Fields": "Id,IndexNumber,UserData,Name",
-                        "IncludeItemTypes": "Episode",
-                    },
-                    headers=_jf_headers(token),
-                    timeout=5,
-                )
-                out["episodes_for_season"] = [
-                    {
-                        "index": i.get("IndexNumber"),
-                        "name": i.get("Name"),
-                        "played": i.get("UserData", {}).get("Played"),
-                    }
-                    for i in r2.json().get("Items", [])[:10]
-                ]
-                out["total_episodes"] = len(r2.json().get("Items", []))
-            except Exception as e:
-                out["episodes_error"] = str(e)
-
-    return jsonify(out)
-
-
 @app.get("/jellyfin/play/<int:season>/<int:episode>")
 def jellyfin_play(season: int, episode: int):
     config = cargar_config()
