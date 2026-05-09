@@ -49,6 +49,7 @@ app.secret_key = "opdes-local-dev"
 # ── Job tracking ───────────────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+_cancel_flags: dict[str, threading.Event] = {}
 
 
 def job_create(job_id: str, label: str) -> None:
@@ -59,6 +60,11 @@ def job_create(job_id: str, label: str) -> None:
             "file_progress": 0, "file_total": 0,
             "files": [], "bytes_progress": 0, "bytes_total": 0,
         }
+    _cancel_flags[job_id] = threading.Event()
+
+
+def job_cancel_event(job_id: str) -> threading.Event | None:
+    return _cancel_flags.get(job_id)
 
 
 def job_update(job_id: str, **kw) -> None:
@@ -74,9 +80,10 @@ def jobs_snapshot() -> dict:
 
 def jobs_clear_done() -> None:
     with _jobs_lock:
-        done = [k for k, v in _jobs.items() if v["status"] in ("done", "error")]
+        done = [k for k, v in _jobs.items() if v["status"] in ("done", "error", "cancelled")]
         for k in done:
             del _jobs[k]
+            _cancel_flags.pop(k, None)
 
 
 # ── Catalog cache ──────────────────────────────────────────────────────────────
@@ -503,6 +510,7 @@ def descargar_archivo_reanudable(
     session: requests.Session,
     url_original: str,
     progress_cb=None,
+    cancel_event: threading.Event | None = None,
 ):
     carpeta_destino.mkdir(parents=True, exist_ok=True)
     destino = carpeta_destino / nombre_archivo
@@ -547,6 +555,8 @@ def descargar_archivo_reanudable(
                         dynamic_ncols=True,
                     ) as pbar:
                         for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                            if cancel_event and cancel_event.is_set():
+                                raise InterruptedError("Cancelado")
                             if chunk:
                                 f.write(chunk)
                                 bytes_escritos += len(chunk)
@@ -555,6 +565,8 @@ def descargar_archivo_reanudable(
                                     progress_cb(bytes_escritos, total)
                 temp.rename(destino)
                 return destino
+            except InterruptedError:
+                raise
             except (ConnectionError, Timeout, ChunkedEncodingError, OSError) as e:
                 ultimo_error = e
                 if intento == MAX_REINTENTOS_DESCARGA:
@@ -625,9 +637,12 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
                 j["bytes_progress"] = sum(f["progress"] for f in files)
         return _cb
 
+    cancel_ev = job_cancel_event(job_id)
     try:
         rutas = []
         for i, archivo in enumerate(archivos_pd):
+            if cancel_ev and cancel_ev.is_set():
+                raise InterruptedError("Cancelado")
             file_id = archivo.get("id")
             if not file_id:
                 continue
@@ -637,7 +652,7 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
                 rutas.append(existente)
                 _mark_done(i)
                 continue
-            ruta = descargar_archivo_reanudable(file_id, nombre, tmp_dir, session, opcion["url"], _make_prog(i))
+            ruta = descargar_archivo_reanudable(file_id, nombre, tmp_dir, session, opcion["url"], _make_prog(i), cancel_ev)
             rutas.append(ruta)
             _mark_done(i)
         rutas_finales = []
@@ -656,6 +671,9 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
                 )
         limpiar_temporales_si_ok(output_dir)
         job_update(job_id, status="done", msg=f"Descargados {len(rutas_finales)} episodio(s).")
+    except InterruptedError:
+        limpiar_temporales_si_ok(output_dir)
+        job_update(job_id, status="cancelled")
     except Exception as e:
         limpiar_temporales_si_ok(output_dir)
         job_update(job_id, status="error", msg=str(e))
@@ -704,11 +722,15 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
     def progress_cb(downloaded: int, total_bytes: int):
         job_update(job_id, file_progress=downloaded, file_total=total_bytes)
 
+    cancel_ev = job_cancel_event(job_id)
     try:
-        ruta = descargar_archivo_reanudable(file_id, pd_nombre, tmp_dir, session, url, progress_cb)
+        ruta = descargar_archivo_reanudable(file_id, pd_nombre, tmp_dir, session, url, progress_cb, cancel_ev)
         renombrar_y_copiar_nfo_segun_metadata(ruta, output_dir, indice_metadatos, arc["season_number"])
         limpiar_temporales_si_ok(output_dir)
         job_update(job_id, status="done", msg=f"Episodio {episode_number} descargado.")
+    except InterruptedError:
+        limpiar_temporales_si_ok(output_dir)
+        job_update(job_id, status="cancelled")
     except Exception as e:
         limpiar_temporales_si_ok(output_dir)
         job_update(job_id, status="error", msg=str(e))
@@ -904,6 +926,8 @@ a{color:inherit;text-decoration:none}
 .job-sum-label{font-size:.82rem;font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .job-toggle{background:none;border:none;color:var(--muted);cursor:pointer;font-size:.75rem;padding:2px 8px;border-radius:4px;line-height:1.4}
 .job-toggle:hover{background:var(--surface2);color:var(--text)}
+.job-stop{background:none;border:1px solid var(--danger);color:var(--danger);cursor:pointer;font-size:.72rem;padding:2px 8px;border-radius:4px;line-height:1.4;white-space:nowrap}
+.job-stop:hover{background:rgba(248,81,73,.15)}
 .job-err-badge{font-size:.72rem;color:var(--danger);background:rgba(248,81,73,.1);padding:2px 8px;border-radius:99px;white-space:nowrap;flex-shrink:0}
 .job-row{display:flex;align-items:center;gap:10px;padding:7px 20px;border-top:1px solid var(--border)}
 .job-row-left{flex:1;min-width:0}
@@ -982,14 +1006,18 @@ function _toggleJobBar(){
   document.getElementById('job-detail').classList.toggle('expanded',_expanded);
   _render(_lastJobs);
 }
+function _cancelAll(){
+  fetch('/api/jobs/cancel',{method:'POST'}).catch(()=>{});
+}
 function _render(jobs){
   _lastJobs=jobs;
   const bar=document.getElementById('job-bar'),sum=document.getElementById('job-summary'),det=document.getElementById('job-detail');
   if(!bar)return;
   const running=Object.entries(jobs).filter(([,v])=>v.status==='running');
   const errors=Object.entries(jobs).filter(([,v])=>v.status==='error');
+  const hasCancelled=Object.values(jobs).some(v=>v.status==='cancelled');
   if(!running.length&&!errors.length){
-    if(_hadRunning){_hadRunning=false;setTimeout(()=>location.reload(),800);}
+    if(_hadRunning||hasCancelled){_hadRunning=false;setTimeout(()=>location.reload(),800);}
     bar.classList.remove('visible');return;
   }
   _hadRunning=running.length>0;
@@ -1000,7 +1028,8 @@ function _render(jobs){
   const sizeStr=totalB>0?_fb(doneB)+' / '+_fb(totalB):'';
   const errBadge=errors.length?'<span class="job-err-badge">'+errors.length+' error'+(errors.length>1?'es':'')+'</span>':'';
   const lbl=running.length?'⬇ '+running.length+' descarga'+(running.length>1?'s':'')+' en curso':(errors.length+' error'+(errors.length>1?'es':''));
-  sum.innerHTML='<div class="job-sum-inner"><span class="job-sum-label">'+lbl+'</span>'+(running.length?'<div class="job-prog"><div class="fill" style="width:'+avgPct+'%"></div></div><span class="job-st">'+avgPct+'%'+(sizeStr?' · '+sizeStr:'')+'</span>':'')+errBadge+'<button class="job-toggle" onclick="_toggleJobBar()">'+(_expanded?'▼':'▲')+'</button></div>';
+  const stopBtn=running.length?'<button class="job-stop" onclick="_cancelAll()">⏹ Detener</button>':'';
+  sum.innerHTML='<div class="job-sum-inner"><span class="job-sum-label">'+lbl+'</span>'+(running.length?'<div class="job-prog"><div class="fill" style="width:'+avgPct+'%"></div></div><span class="job-st">'+avgPct+'%'+(sizeStr?' · '+sizeStr:'')+'</span>':'')+errBadge+stopBtn+'<button class="job-toggle" onclick="_toggleJobBar()">'+(_expanded?'▼':'▲')+'</button></div>';
   det.innerHTML=running.map(([,j])=>_jobRow(j)).join('')+errors.map(([,j])=>'<div class="job-err">✕ '+j.label+': '+j.msg+'</div>').join('');
   document.querySelectorAll('[data-job-id]').forEach(el=>{
     const j=jobs[el.dataset.jobId];
@@ -1280,6 +1309,17 @@ def api_jobs():
 def api_jobs_clear():
     jobs_clear_done()
     return jsonify({"ok": True})
+
+
+@app.post("/api/jobs/cancel")
+def api_jobs_cancel():
+    with _jobs_lock:
+        running = [jid for jid, j in _jobs.items() if j["status"] == "running"]
+    for jid in running:
+        ev = _cancel_flags.get(jid)
+        if ev:
+            ev.set()
+    return jsonify({"ok": True, "cancelled": running})
 
 
 @app.get("/jellyfin/play/<int:season>/<int:episode>")
