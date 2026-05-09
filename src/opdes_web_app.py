@@ -673,7 +673,7 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
     tmp_dir = output_dir / "_tmp" / slugify(arc["id"])
 
     def progress_cb(downloaded: int, total_bytes: int):
-        job_update(job_id, progress=downloaded, total=total_bytes)
+        job_update(job_id, file_progress=downloaded, file_total=total_bytes)
 
     try:
         ruta = descargar_archivo_reanudable(file_id, pd_nombre, tmp_dir, session, url, progress_cb)
