@@ -56,7 +56,8 @@ def job_create(job_id: str, label: str) -> None:
         _jobs[job_id] = {
             "status": "running", "label": label,
             "progress": 0, "total": 0, "msg": "",
-            "file_progress": 0, "file_total": 0, "file_label": "",
+            "file_progress": 0, "file_total": 0,
+            "files": [], "bytes_progress": 0, "bytes_total": 0,
         }
 
 
@@ -584,33 +585,61 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
     tmp_dir = output_dir / "_tmp" / slugify(arc["id"])
     try:
         archivos_pd = obtener_archivos_lista_pixeldrain(opcion["url"])
-        job_update(job_id, total=len(archivos_pd))
+        files_manifest = [
+            {"name": a.get("name") or f"{a.get('id','?')}.bin",
+             "size": a.get("size", 0), "progress": 0, "done": False}
+            for a in archivos_pd
+        ]
+        bytes_total = sum(f["size"] for f in files_manifest)
+        job_update(job_id, total=len(archivos_pd), files=files_manifest,
+                   bytes_total=bytes_total, bytes_progress=0)
     except Exception as e:
         job_update(job_id, status="error", msg=str(e))
         return
     done = [0]
-    def on_file_done():
+
+    def _mark_done(idx: int) -> None:
         done[0] += 1
-        job_update(job_id, progress=done[0])
+        with _jobs_lock:
+            if job_id not in _jobs:
+                return
+            j = _jobs[job_id]
+            j["progress"] = done[0]
+            files = j.get("files", [])
+            if idx < len(files):
+                files[idx]["done"] = True
+                files[idx]["progress"] = files[idx]["size"]
+            j["bytes_progress"] = sum(f["progress"] for f in files)
+
+    def _make_prog(idx: int):
+        def _cb(dl: int, tot: int) -> None:
+            with _jobs_lock:
+                if job_id not in _jobs:
+                    return
+                j = _jobs[job_id]
+                files = j.get("files", [])
+                if idx < len(files):
+                    files[idx]["progress"] = dl
+                    if tot:
+                        files[idx]["size"] = tot
+                j["bytes_progress"] = sum(f["progress"] for f in files)
+        return _cb
+
     try:
         rutas = []
-        tipo, item_id = extraer_tipo_e_id(opcion["url"])
-        for archivo in archivos_pd:
+        for i, archivo in enumerate(archivos_pd):
             file_id = archivo.get("id")
             if not file_id:
                 continue
             nombre = archivo.get("name") or f"{file_id}.bin"
-            job_update(job_id, file_label=nombre, file_progress=0, file_total=0)
             existente = archivo_ya_existe_en_destino_final(nombre, output_dir, indice_metadatos, arc["season_number"])
             if existente:
                 rutas.append(existente)
-                on_file_done()
+                _mark_done(i)
                 continue
-            def _prog(dl, tot, _jid=job_id):
-                job_update(_jid, file_progress=dl, file_total=tot)
-            ruta = descargar_archivo_reanudable(file_id, nombre, tmp_dir, session, opcion["url"], _prog)
+            ruta = descargar_archivo_reanudable(file_id, nombre, tmp_dir, session, opcion["url"], _make_prog(i))
             rutas.append(ruta)
-            on_file_done()
+            _mark_done(i)
         rutas_finales = []
         for ruta in rutas:
             ruta_path = Path(ruta)
@@ -892,6 +921,17 @@ a{color:inherit;text-decoration:none}
 .ep-dl-bar .fill{height:100%;background:var(--accent);border-radius:99px;width:0%;transition:width .4s}
 .ep-dl-label{font-size:.68rem;color:var(--muted);white-space:nowrap}
 
+/* Job files list in detail panel */
+.job-files{padding:4px 0 2px;display:flex;flex-direction:column;gap:2px}
+.jf-row{display:flex;align-items:center;gap:6px;font-size:.7rem;padding:1px 0;white-space:nowrap;overflow:hidden}
+.jf-name{flex:1;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.jf-size{flex-shrink:0;font-size:.65rem;opacity:.8}
+.jf-done{color:var(--success)}
+.jf-active{color:var(--accent)}
+.jf-pending{color:var(--muted)}
+.job-prog.sm{width:50px;height:2px;flex-shrink:0}
+.job-count{font-size:.7rem;color:var(--muted);margin-top:1px}
+
 /* Season card downloading pulse */
 .season-card.dl-active .prog-bar .fill{animation:dl-pulse 1.4s ease-in-out infinite alternate}
 @keyframes dl-pulse{to{opacity:.35}}
@@ -908,69 +948,66 @@ a{color:inherit;text-decoration:none}
 """
 
 JS = """
-let _hadRunning=false,_expanded=false;
-function _fb(b){if(!b)return'';if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
+let _hadRunning=false,_expanded=false,_lastJobs={};
+function _fb(b){if(!b||b<1)return'';if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
 function _pct(j){
+  if(j.bytes_total>0)return Math.round(j.bytes_progress/j.bytes_total*100);
   if(j.file_total>0)return Math.round(j.file_progress/j.file_total*100);
-  if(j.total>0)return Math.round(j.progress/j.total*100);
   return 0;
 }
 function _stat(j){
+  if(j.bytes_total>0)return _fb(j.bytes_progress)+' / '+_fb(j.bytes_total);
   if(j.file_total>0)return _fb(j.file_progress)+' / '+_fb(j.file_total);
-  if(j.total>0)return j.progress+'/'+j.total+' archivos';
   return '';
+}
+function _jobRow(j){
+  const p=_pct(j),s=_stat(j);
+  let extra='';
+  if(j.files&&j.files.length>0){
+    extra='<div class="job-count">'+j.progress+'/'+j.total+' archivos</div>';
+    extra+='<div class="job-files">'+j.files.map(f=>{
+      if(f.done)return '<div class="jf-row jf-done">✓ <span class="jf-name">'+f.name+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
+      if(f.progress>0){const fp=f.size>0?Math.round(f.progress/f.size*100):0;return '<div class="jf-row jf-active">⬇ <span class="jf-name">'+f.name+'</span><div class="job-prog sm"><div class="fill" style="width:'+fp+'%"></div></div><span class="jf-size">'+_fb(f.progress)+' / '+_fb(f.size)+'</span></div>';}
+      return '<div class="jf-row jf-pending">○ <span class="jf-name">'+f.name+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
+    }).join('')+'</div>';
+  }
+  return '<div class="job-row"><div class="job-row-left"><span class="job-lbl">'+j.label+'</span>'+extra+'</div><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div>';
 }
 function _toggleJobBar(){
   _expanded=!_expanded;
-  const d=document.getElementById('job-detail');
-  if(d)d.classList.toggle('expanded',_expanded);
+  document.getElementById('job-detail').classList.toggle('expanded',_expanded);
   _render(_lastJobs);
 }
-let _lastJobs={};
 function _render(jobs){
   _lastJobs=jobs;
-  const bar=document.getElementById('job-bar');
-  const sum=document.getElementById('job-summary');
-  const det=document.getElementById('job-detail');
+  const bar=document.getElementById('job-bar'),sum=document.getElementById('job-summary'),det=document.getElementById('job-detail');
   if(!bar)return;
   const running=Object.entries(jobs).filter(([,v])=>v.status==='running');
   const errors=Object.entries(jobs).filter(([,v])=>v.status==='error');
-  if(running.length===0&&errors.length===0){
+  if(!running.length&&!errors.length){
     if(_hadRunning){_hadRunning=false;setTimeout(()=>location.reload(),800);}
     bar.classList.remove('visible');return;
   }
   _hadRunning=running.length>0;
   bar.classList.add('visible');
-  // Summary line
-  const avgPct=running.length?Math.round(running.reduce((s,[,j])=>s+_pct(j),0)/running.length):0;
-  const errBadge=errors.length?`<span class="job-err-badge">${errors.length} error${errors.length>1?'es':''}</span>`:'';
-  const sumLabel=running.length?`⬇ ${running.length} descarga${running.length>1?'s':''} en curso`:(errors.length?`${errors.length} error${errors.length>1?'es':''}`:'');
-  sum.innerHTML=`<div class="job-sum-inner">
-    <span class="job-sum-label">${sumLabel}</span>
-    ${running.length?`<div class="job-prog"><div class="fill" style="width:${avgPct}%"></div></div><span class="job-st">${avgPct}%</span>`:''}
-    ${errBadge}
-    <button class="job-toggle" onclick="_toggleJobBar()">${_expanded?'▼':'▲'}</button>
-  </div>`;
-  // Detail rows
-  det.innerHTML=running.map(([,j])=>{
-    const p=_pct(j),s=_stat(j);
-    const sub=j.file_label?`<div class="job-sub-label">${j.file_label}</div>`:'';
-    return `<div class="job-row"><div class="job-row-left"><span class="job-lbl">${j.label}</span>${sub}</div><div class="job-prog"><div class="fill" style="width:${p}%"></div></div><span class="job-st">${p>0?p+'%':'…'}${s?' · '+s:''}</span></div>`;
-  }).join('')+errors.map(([,j])=>`<div class="job-err">✕ ${j.label}: ${j.msg}</div>`).join('');
-  // Episode inline progress
+  const totalB=running.reduce((s,[,j])=>s+(j.bytes_total||j.file_total||0),0);
+  const doneB=running.reduce((s,[,j])=>s+(j.bytes_progress||j.file_progress||0),0);
+  const avgPct=totalB>0?Math.round(doneB/totalB*100):(running.length?Math.round(running.reduce((s,[,j])=>s+_pct(j),0)/running.length):0);
+  const sizeStr=totalB>0?_fb(doneB)+' / '+_fb(totalB):'';
+  const errBadge=errors.length?'<span class="job-err-badge">'+errors.length+' error'+(errors.length>1?'es':'')+'</span>':'';
+  const lbl=running.length?'⬇ '+running.length+' descarga'+(running.length>1?'s':'')+' en curso':(errors.length+' error'+(errors.length>1?'es':''));
+  sum.innerHTML='<div class="job-sum-inner"><span class="job-sum-label">'+lbl+'</span>'+(running.length?'<div class="job-prog"><div class="fill" style="width:'+avgPct+'%"></div></div><span class="job-st">'+avgPct+'%'+(sizeStr?' · '+sizeStr:'')+'</span>':'')+errBadge+'<button class="job-toggle" onclick="_toggleJobBar()">'+(_expanded?'▼':'▲')+'</button></div>';
+  det.innerHTML=running.map(([,j])=>_jobRow(j)).join('')+errors.map(([,j])=>'<div class="job-err">✕ '+j.label+': '+j.msg+'</div>').join('');
   document.querySelectorAll('[data-job-id]').forEach(el=>{
     const j=jobs[el.dataset.jobId];
     if(!j||j.status!=='running')return;
-    const fill=el.querySelector('.ep-dl-bar .fill');
-    const lbl=el.querySelector('.ep-dl-label');
+    const fill=el.querySelector('.ep-dl-bar .fill'),lbl=el.querySelector('.ep-dl-label');
     if(!fill||!lbl)return;
     fill.style.width=_pct(j)+'%';
     lbl.textContent=_stat(j)||'…';
   });
-  // Season card pulse on home
   document.querySelectorAll('.season-card[data-season]').forEach(card=>{
-    const jid='season-'+card.dataset.season;
-    card.classList.toggle('dl-active',!!(jobs[jid]&&jobs[jid].status==='running'));
+    card.classList.toggle('dl-active',!!(jobs['season-'+card.dataset.season]?.status==='running'));
   });
 }
 function _poll(){fetch('/api/jobs').then(r=>r.json()).then(_render).catch(()=>{});setTimeout(_poll,2000);}
