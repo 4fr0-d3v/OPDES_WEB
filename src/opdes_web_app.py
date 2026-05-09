@@ -939,6 +939,7 @@ LAYOUT = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{% block title %}ONE PACE DES{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <style>{{ css|safe }}</style>
 </head>
 <body>
@@ -1117,6 +1118,24 @@ def jellyfin_find_episode(season: int, episode: int, config: dict) -> str | None
 
 
 # ── Image routes ───────────────────────────────────────────────────────────────
+
+@app.get("/favicon.svg")
+def favicon():
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80">'
+        # crown
+        '<ellipse cx="50" cy="33" rx="26" ry="21" fill="#e8b84b"/>'
+        # red ribbon
+        '<rect x="23" y="47" width="54" height="9" rx="2" fill="#dc2626"/>'
+        # brim
+        '<ellipse cx="50" cy="59" rx="46" ry="11" fill="#e8b84b"/>'
+        # outlines
+        '<ellipse cx="50" cy="33" rx="26" ry="21" fill="none" stroke="#b8860b" stroke-width="2"/>'
+        '<ellipse cx="50" cy="59" rx="46" ry="11" fill="none" stroke="#b8860b" stroke-width="2"/>'
+        '</svg>'
+    )
+    return app.response_class(svg, mimetype="image/svg+xml")
+
 
 @app.get("/img/show/poster")
 def img_show_poster():
@@ -1366,7 +1385,8 @@ def sync_metadata_route():
 @app.before_request
 def check_setup():
     if request.endpoint in {"setup", "save_setup", "sync_metadata_route", "img_show_poster",
-                             "img_show_backdrop", "img_season_poster", "api_jobs", "api_jobs_clear", "static"}:
+                             "img_show_backdrop", "img_season_poster", "api_jobs", "api_jobs_clear",
+                             "favicon", "static"}:
         return
     config = cargar_config()
     if not config_completa(config):
