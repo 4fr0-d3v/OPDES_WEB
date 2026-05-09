@@ -53,7 +53,11 @@ _jobs_lock = threading.Lock()
 
 def job_create(job_id: str, label: str) -> None:
     with _jobs_lock:
-        _jobs[job_id] = {"status": "running", "label": label, "progress": 0, "total": 0, "msg": ""}
+        _jobs[job_id] = {
+            "status": "running", "label": label,
+            "progress": 0, "total": 0, "msg": "",
+            "file_progress": 0, "file_total": 0, "file_label": "",
+        }
 
 
 def job_update(job_id: str, **kw) -> None:
@@ -596,12 +600,15 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
             if not file_id:
                 continue
             nombre = archivo.get("name") or f"{file_id}.bin"
+            job_update(job_id, file_label=nombre, file_progress=0, file_total=0)
             existente = archivo_ya_existe_en_destino_final(nombre, output_dir, indice_metadatos, arc["season_number"])
             if existente:
                 rutas.append(existente)
                 on_file_done()
                 continue
-            ruta = descargar_archivo_reanudable(file_id, nombre, tmp_dir, session, opcion["url"])
+            def _prog(dl, tot, _jid=job_id):
+                job_update(_jid, file_progress=dl, file_total=tot)
+            ruta = descargar_archivo_reanudable(file_id, nombre, tmp_dir, session, opcion["url"], _prog)
             rutas.append(ruta)
             on_file_done()
         rutas_finales = []
@@ -858,15 +865,36 @@ a{color:inherit;text-decoration:none}
 .no-av{font-size:.72rem;color:var(--muted);font-style:italic}
 
 /* Job bar */
-#job-bar{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--border);padding:10px 24px;z-index:200;display:none}
+#job-bar{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--border);z-index:200;display:none}
 #job-bar.visible{display:block}
-.job-row{display:flex;align-items:center;gap:12px;padding:4px 0}
-.job-lbl{font-size:.82rem;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.job-prog{width:100px;height:4px;background:var(--surface2);border-radius:99px;overflow:hidden;flex-shrink:0}
+#job-detail{max-height:0;overflow:hidden;transition:max-height .28s ease}
+#job-detail.expanded{max-height:340px;overflow-y:auto}
+#job-summary{padding:8px 20px;cursor:pointer;user-select:none}
+#job-summary:hover{background:rgba(255,255,255,.03)}
+.job-sum-inner{display:flex;align-items:center;gap:10px}
+.job-sum-label{font-size:.82rem;font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.job-toggle{background:none;border:none;color:var(--muted);cursor:pointer;font-size:.75rem;padding:2px 8px;border-radius:4px;line-height:1.4}
+.job-toggle:hover{background:var(--surface2);color:var(--text)}
+.job-err-badge{font-size:.72rem;color:var(--danger);background:rgba(248,81,73,.1);padding:2px 8px;border-radius:99px;white-space:nowrap;flex-shrink:0}
+.job-row{display:flex;align-items:center;gap:10px;padding:7px 20px;border-top:1px solid var(--border)}
+.job-row-left{flex:1;min-width:0}
+.job-lbl{font-size:.82rem;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.job-sub-label{font-size:.7rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.job-prog{width:70px;height:3px;background:var(--surface2);border-radius:99px;overflow:hidden;flex-shrink:0}
 .job-prog .fill{height:100%;background:var(--accent);border-radius:99px;transition:width .4s}
-.job-st{font-size:.75rem;color:var(--muted);min-width:40px;text-align:right;flex-shrink:0}
-.job-msg{font-size:.78rem;color:var(--success);padding:4px 0}
-.job-err{font-size:.78rem;color:var(--danger);padding:4px 0}
+.job-st{font-size:.7rem;color:var(--muted);min-width:100px;text-align:right;flex-shrink:0;white-space:nowrap}
+.job-err{font-size:.78rem;color:var(--danger);padding:7px 20px;border-top:1px solid var(--border)}
+
+/* Episode inline download progress */
+.ep-dl-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:4px}
+.ep-dl-progress{display:flex;align-items:center;gap:6px}
+.ep-dl-bar{width:80px;height:3px;background:var(--surface2);border-radius:99px;overflow:hidden}
+.ep-dl-bar .fill{height:100%;background:var(--accent);border-radius:99px;width:0%;transition:width .4s}
+.ep-dl-label{font-size:.68rem;color:var(--muted);white-space:nowrap}
+
+/* Season card downloading pulse */
+.season-card.dl-active .prog-bar .fill{animation:dl-pulse 1.4s ease-in-out infinite alternate}
+@keyframes dl-pulse{to{opacity:.35}}
 
 /* Responsive */
 @media(max-width:640px){
@@ -880,50 +908,73 @@ a{color:inherit;text-decoration:none}
 """
 
 JS = """
-let _hadRunning = false;
-function _fmtBytes(b){
-  if(!b)return '';
-  if(b>1e9)return (b/1e9).toFixed(1)+' GB';
-  if(b>1e6)return (b/1e6).toFixed(1)+' MB';
-  return (b/1e3).toFixed(0)+' KB';
+let _hadRunning=false,_expanded=false;
+function _fb(b){if(!b)return'';if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
+function _pct(j){
+  if(j.file_total>0)return Math.round(j.file_progress/j.file_total*100);
+  if(j.total>0)return Math.round(j.progress/j.total*100);
+  return 0;
 }
-function _pollJobs(){
-  fetch('/api/jobs').then(r=>r.json()).then(jobs=>{
-    const bar=document.getElementById('job-bar');
-    const cont=document.getElementById('job-items');
-    if(!bar||!cont)return;
-    const running=Object.entries(jobs).filter(([,v])=>v.status==='running');
-    const errors=Object.entries(jobs).filter(([,v])=>v.status==='error');
-    if(running.length>0){
-      _hadRunning=true;
-      bar.classList.add('visible');
-      cont.innerHTML=running.map(([id,j])=>{
-        const pct=j.total>0?Math.round(j.progress/j.total*100):0;
-        const sz=j.total>0?_fmtBytes(j.total):'';
-        return `<div class="job-row">
-          <span class="job-lbl">${j.label}</span>
-          <div class="job-prog"><div class="fill" style="width:${pct}%"></div></div>
-          <span class="job-st">${pct>0?pct+'%':'...'} ${sz?'/ '+sz:''}</span>
-        </div>`;
-      }).join('')+(errors.length?errors.map(([,j])=>`<div class="job-err">Error: ${j.msg}</div>`).join(''):'');
-    } else {
-      if(_hadRunning){
-        _hadRunning=false;
-        setTimeout(()=>location.reload(),800);
-      }
-      if(errors.length){
-        bar.classList.add('visible');
-        cont.innerHTML=errors.map(([,j])=>`<div class="job-err">Error: ${j.msg}</div>`).join('');
-      } else {
-        bar.classList.remove('visible');
-      }
-    }
-  }).catch(()=>{});
-  setTimeout(_pollJobs,2000);
+function _stat(j){
+  if(j.file_total>0)return _fb(j.file_progress)+' / '+_fb(j.file_total);
+  if(j.total>0)return j.progress+'/'+j.total+' archivos';
+  return '';
 }
-document.addEventListener('DOMContentLoaded',()=>{
-  _pollJobs();
-});
+function _toggleJobBar(){
+  _expanded=!_expanded;
+  const d=document.getElementById('job-detail');
+  if(d)d.classList.toggle('expanded',_expanded);
+  _render(_lastJobs);
+}
+let _lastJobs={};
+function _render(jobs){
+  _lastJobs=jobs;
+  const bar=document.getElementById('job-bar');
+  const sum=document.getElementById('job-summary');
+  const det=document.getElementById('job-detail');
+  if(!bar)return;
+  const running=Object.entries(jobs).filter(([,v])=>v.status==='running');
+  const errors=Object.entries(jobs).filter(([,v])=>v.status==='error');
+  if(running.length===0&&errors.length===0){
+    if(_hadRunning){_hadRunning=false;setTimeout(()=>location.reload(),800);}
+    bar.classList.remove('visible');return;
+  }
+  _hadRunning=running.length>0;
+  bar.classList.add('visible');
+  // Summary line
+  const avgPct=running.length?Math.round(running.reduce((s,[,j])=>s+_pct(j),0)/running.length):0;
+  const errBadge=errors.length?`<span class="job-err-badge">${errors.length} error${errors.length>1?'es':''}</span>`:'';
+  const sumLabel=running.length?`⬇ ${running.length} descarga${running.length>1?'s':''} en curso`:(errors.length?`${errors.length} error${errors.length>1?'es':''}`:'');
+  sum.innerHTML=`<div class="job-sum-inner">
+    <span class="job-sum-label">${sumLabel}</span>
+    ${running.length?`<div class="job-prog"><div class="fill" style="width:${avgPct}%"></div></div><span class="job-st">${avgPct}%</span>`:''}
+    ${errBadge}
+    <button class="job-toggle" onclick="_toggleJobBar()">${_expanded?'▼':'▲'}</button>
+  </div>`;
+  // Detail rows
+  det.innerHTML=running.map(([,j])=>{
+    const p=_pct(j),s=_stat(j);
+    const sub=j.file_label?`<div class="job-sub-label">${j.file_label}</div>`:'';
+    return `<div class="job-row"><div class="job-row-left"><span class="job-lbl">${j.label}</span>${sub}</div><div class="job-prog"><div class="fill" style="width:${p}%"></div></div><span class="job-st">${p>0?p+'%':'…'}${s?' · '+s:''}</span></div>`;
+  }).join('')+errors.map(([,j])=>`<div class="job-err">✕ ${j.label}: ${j.msg}</div>`).join('');
+  // Episode inline progress
+  document.querySelectorAll('[data-job-id]').forEach(el=>{
+    const j=jobs[el.dataset.jobId];
+    if(!j||j.status!=='running')return;
+    const fill=el.querySelector('.ep-dl-bar .fill');
+    const lbl=el.querySelector('.ep-dl-label');
+    if(!fill||!lbl)return;
+    fill.style.width=_pct(j)+'%';
+    lbl.textContent=_stat(j)||'…';
+  });
+  // Season card pulse on home
+  document.querySelectorAll('.season-card[data-season]').forEach(card=>{
+    const jid='season-'+card.dataset.season;
+    card.classList.toggle('dl-active',!!(jobs[jid]&&jobs[jid].status==='running'));
+  });
+}
+function _poll(){fetch('/api/jobs').then(r=>r.json()).then(_render).catch(()=>{});setTimeout(_poll,2000);}
+document.addEventListener('DOMContentLoaded',_poll);
 """
 
 
@@ -959,7 +1010,7 @@ LAYOUT = """<!doctype html>
 {% for cat, msg in msgs %}<div class="flash {% if cat=='error' %}err{% endif %}">{{ msg }}</div>{% endfor %}
 </div>{% endif %}{% endwith %}
 <div class="main">{{ content|safe }}</div>
-<div id="job-bar"><div id="job-items"></div></div>
+<div id="job-bar"><div id="job-detail"></div><div id="job-summary" onclick="_toggleJobBar()"></div></div>
 <script>{{ js|safe }}</script>
 </body>
 </html>"""
@@ -1424,7 +1475,7 @@ def home():
             dot = "partial"
         prog_text = f"{dl}/{total}" if total else "—"
         cards.append(f"""
-<a class="season-card" href="/season/{n}">
+<a class="season-card" href="/season/{n}" data-season="{n}">
   <div class="poster-wrap">
     <img src="/img/season/{n}/poster" alt="" onerror="this.parentNode.innerHTML='<div class=no-poster>🏴‍☠️</div>'">
     <span class="status-dot {dot}"></span>
@@ -1548,7 +1599,15 @@ def season_detail(n: int):
                 watched_badge = f'<form method="post" action="/jellyfin/watched/{n}/{en}" style="display:inline"><button class="ep-badge unwatched" type="submit" title="Marcar como visto">○ No visto</button></form>'
 
         if ep_downloading:
-            action = "<span style='color:var(--accent);font-size:.75rem'>⏳ Descargando…</span>"
+            action = (
+                f'<div class="ep-dl-wrap" data-job-id="{ep_job_id}">'
+                f'<span class="ep-badge" style="background:rgba(246,162,0,.15);color:var(--accent)">⬇ Descargando</span>'
+                f'<div class="ep-dl-progress">'
+                f'<div class="ep-dl-bar"><div class="fill" style="width:0%"></div></div>'
+                f'<span class="ep-dl-label">…</span>'
+                f'</div>'
+                f'</div>'
+            )
         elif downloaded:
             play_btn = f'<a class="btn btn-primary btn-sm" href="/jellyfin/play/{n}/{en}" title="Ver en Jellyfin">▶</a>' if jellyfin_url else ""
             del_btn = f'<form method="post" action="/delete/season/{n}/episode/{en}" onsubmit="return confirm(\'¿Eliminar episodio {en}?\')"><button class="btn btn-danger btn-sm" type="submit">🗑</button></form>'
