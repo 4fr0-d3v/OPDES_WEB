@@ -922,15 +922,18 @@ a{color:inherit;text-decoration:none}
 .ep-dl-label{font-size:.68rem;color:var(--muted);white-space:nowrap}
 
 /* Job files list in detail panel */
-.job-files{padding:4px 0 2px;display:flex;flex-direction:column;gap:2px}
-.jf-row{display:flex;align-items:center;gap:6px;font-size:.7rem;padding:1px 0;white-space:nowrap;overflow:hidden}
+.job-card{border-top:1px solid var(--border);padding:7px 20px}
+.job-card-hdr{display:flex;align-items:center;gap:10px}
+.job-card-hdr .job-lbl{flex:1;font-size:.82rem}
+.job-count{font-size:.7rem;color:var(--muted);margin:2px 0 4px}
+.job-files{display:flex;flex-direction:column;gap:3px}
+.jf-row{display:flex;align-items:center;gap:6px;font-size:.7rem;white-space:nowrap;overflow:hidden}
 .jf-name{flex:1;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .jf-size{flex-shrink:0;font-size:.65rem;opacity:.8}
 .jf-done{color:var(--success)}
 .jf-active{color:var(--accent)}
 .jf-pending{color:var(--muted)}
 .job-prog.sm{width:50px;height:2px;flex-shrink:0}
-.job-count{font-size:.7rem;color:var(--muted);margin-top:1px}
 
 /* Season card downloading pulse */
 .season-card.dl-active .prog-bar .fill{animation:dl-pulse 1.4s ease-in-out infinite alternate}
@@ -962,16 +965,17 @@ function _stat(j){
 }
 function _jobRow(j){
   const p=_pct(j),s=_stat(j);
-  let extra='';
   if(j.files&&j.files.length>0){
-    extra='<div class="job-count">'+j.progress+'/'+j.total+' archivos</div>';
-    extra+='<div class="job-files">'+j.files.map(f=>{
+    // Season job: header with overall bar, then file list below full-width
+    const filesHtml=j.files.map(f=>{
       if(f.done)return '<div class="jf-row jf-done">✓ <span class="jf-name">'+f.name+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
       if(f.progress>0){const fp=f.size>0?Math.round(f.progress/f.size*100):0;return '<div class="jf-row jf-active">⬇ <span class="jf-name">'+f.name+'</span><div class="job-prog sm"><div class="fill" style="width:'+fp+'%"></div></div><span class="jf-size">'+_fb(f.progress)+' / '+_fb(f.size)+'</span></div>';}
       return '<div class="jf-row jf-pending">○ <span class="jf-name">'+f.name+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
-    }).join('')+'</div>';
+    }).join('');
+    return '<div class="job-card"><div class="job-card-hdr"><span class="job-lbl">'+j.label+'</span><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div><div class="job-count">'+j.progress+'/'+j.total+' archivos</div><div class="job-files">'+filesHtml+'</div></div>';
   }
-  return '<div class="job-row"><div class="job-row-left"><span class="job-lbl">'+j.label+'</span>'+extra+'</div><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div>';
+  // Episode job: simple single row
+  return '<div class="job-row"><div class="job-row-left"><span class="job-lbl">'+j.label+'</span></div><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div>';
 }
 function _toggleJobBar(){
   _expanded=!_expanded;
