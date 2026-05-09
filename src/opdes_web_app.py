@@ -1015,9 +1015,8 @@ function _render(jobs){
   if(!bar)return;
   const running=Object.entries(jobs).filter(([,v])=>v.status==='running');
   const errors=Object.entries(jobs).filter(([,v])=>v.status==='error');
-  const hasCancelled=Object.values(jobs).some(v=>v.status==='cancelled');
   if(!running.length&&!errors.length){
-    if(_hadRunning||hasCancelled){_hadRunning=false;setTimeout(()=>location.reload(),800);}
+    if(_hadRunning){_hadRunning=false;setTimeout(()=>location.reload(),800);}
     bar.classList.remove('visible');return;
   }
   _hadRunning=running.length>0;
