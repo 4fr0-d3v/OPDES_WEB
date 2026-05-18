@@ -385,7 +385,7 @@ def construir_indice_metadatos(metadata_root: Path) -> dict:
 
 def parsear_nombre_descargado(nombre_archivo: str):
     patron = re.compile(
-        r"^\[One Pace\]\[[^\]]+\]\s+(.+?)\s+(\d+)\s+\[[^\]]+\]\[[^\]]+\]\[[0-9A-Fa-f]{8}\](\.[^.]+)$"
+        r"^\[One Pace\]\[[^\]]+\]\s+(.+?)\s+(\d+)\s+(?:[A-Za-z][^\[]+)?\[[^\]]+\]\[[^\]]+\]\[[0-9A-Fa-f]{8}\](\.[^.]+)$"
     )
     m = patron.match(nombre_archivo)
     if not m:
