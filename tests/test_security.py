@@ -95,3 +95,55 @@ def test_safe_extract_zip_rejects_path_traversal(tmp_path):
     with zipfile.ZipFile(zip_bytes) as zf:
         with pytest.raises(RuntimeError):
             webapp.safe_extract_zip(zf, tmp_path / "extract")
+
+
+def test_pixeldrain_video_files_ignores_non_video_entries(monkeypatch):
+    monkeypatch.setattr(
+        webapp,
+        "obtener_archivos_lista_pixeldrain",
+        lambda url: [
+            {"name": "episode.mp4", "id": "video"},
+            {"name": "wip.md", "id": "note"},
+            {"name": "poster.jpg", "id": "image"},
+        ],
+    )
+
+    files = webapp.pixeldrain_video_files("https://pixeldrain.net/l/example")
+
+    assert [f["id"] for f in files] == ["video"]
+
+
+def test_episode_availability_uses_pixeldrain_manifest(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output"
+    metadata_dir = tmp_path / "metadata"
+    season_dir = metadata_dir / "Season 1"
+    season_dir.mkdir(parents=True)
+    output_dir.mkdir()
+    (season_dir / "season.nfo").write_text("<season><title>Season 1</title></season>", encoding="utf-8")
+    for episode in [1, 2]:
+        (season_dir / f"S01E{episode:02d}.nfo").write_text(
+            f"<episodedetails><title>Episode {episode}</title></episodedetails>",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        webapp,
+        "cargar_arc_por_numero",
+        lambda season, config: {
+            "id": "arc",
+            "season_number": season,
+            "season_title": "Arc",
+            "elegida": {"url": "https://pixeldrain.net/l/example", "quality": "1080p"},
+        },
+    )
+    monkeypatch.setattr(webapp, "pixeldrain_available_episodes", lambda url: {1})
+
+    detail = webapp.cargar_detalle_temporada(
+        1,
+        {
+            **webapp.DEFAULT_CONFIG,
+            "output_dir": str(output_dir),
+            "metadata_dir": str(metadata_dir),
+        },
+    )
+
+    assert [episode["available"] for episode in detail["episodes"]] == [True, False]

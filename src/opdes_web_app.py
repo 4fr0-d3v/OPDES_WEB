@@ -111,6 +111,7 @@ def jobs_clear_done() -> None:
 
 # ── Catalog cache ──────────────────────────────────────────────────────────────
 _catalog_cache: dict = {"data": None, "ts": 0.0}
+_pixeldrain_episode_cache: dict[str, dict] = {}
 CATALOG_TTL = 3600.0
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -449,6 +450,28 @@ def obtener_archivos_lista_pixeldrain(url: str) -> list[dict]:
     return data.get("files", [])
 
 
+def pixeldrain_video_files(url: str) -> list[dict]:
+    files = obtener_archivos_lista_pixeldrain(url)
+    return [
+        f for f in files
+        if Path(f.get("name") or "").suffix.lower() in VIDEO_EXTS
+    ]
+
+
+def pixeldrain_available_episodes(url: str) -> set[int]:
+    now = time.time()
+    cached = _pixeldrain_episode_cache.get(url)
+    if cached and now - cached["ts"] < CATALOG_TTL:
+        return set(cached["episodes"])
+    episodes: set[int] = set()
+    for file_info in pixeldrain_video_files(url):
+        parsed = parsear_nombre_descargado(file_info.get("name") or "")
+        if parsed:
+            episodes.add(parsed["episode_in_arc"])
+    _pixeldrain_episode_cache[url] = {"episodes": sorted(episodes), "ts": now}
+    return episodes
+
+
 # ── Metadata ───────────────────────────────────────────────────────────────────
 
 def sync_metadata(config: dict) -> None:
@@ -756,7 +779,7 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
     session = crear_sesion()
     tmp_dir = output_dir / "_tmp" / slugify(arc["id"])
     try:
-        archivos_pd = obtener_archivos_lista_pixeldrain(opcion["url"])
+        archivos_pd = pixeldrain_video_files(opcion["url"])
         files_manifest = [
             {"name": a.get("name") or f"{a.get('id','?')}.bin",
              "size": a.get("size", 0), "progress": 0, "done": False}
@@ -856,7 +879,7 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
             file_id = item_id
             pd_nombre = info.get("name") or f"{item_id}.bin"
         else:
-            archivos = pedir_json_resistente(f"/list/{item_id}", url).get("files", [])
+            archivos = pixeldrain_video_files(url)
             archivo_target = None
             for archivo in archivos:
                 nombre = archivo.get("name") or ""
@@ -939,6 +962,12 @@ def cargar_detalle_temporada(season_number: int, config: dict) -> dict | None:
     metadata_dir = Path(config["metadata_dir"]).expanduser()
     indice_metadatos = construir_indice_metadatos(metadata_dir)
     season_meta = indice_metadatos.get(season_number)
+    available_episodes = None
+    if arc.get("elegida"):
+        try:
+            available_episodes = pixeldrain_available_episodes(arc["elegida"]["url"])
+        except Exception:
+            available_episodes = None
     episodes = []
     if season_meta:
         for ep_num, ep_nfo in sorted(season_meta["episodes"].items()):
@@ -950,7 +979,7 @@ def cargar_detalle_temporada(season_number: int, config: dict) -> dict | None:
                 "plot": ep_info["plot"],
                 "aired": ep_info["aired"],
                 "downloaded": downloaded,
-                "available": arc.get("elegida") is not None,
+                "available": ep_num in available_episodes if available_episodes is not None else arc.get("elegida") is not None,
             })
     return {"arc": arc, "season_meta": season_meta, "episodes": episodes}
 
