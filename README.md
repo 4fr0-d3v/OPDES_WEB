@@ -24,10 +24,12 @@ export OPDES_ADMIN_USER="admin"
 export OPDES_ADMIN_PASSWORD_HASH="hash-generado-con-werkzeug"
 export OPDES_ALLOWED_PATHS="/mnt/nfs/data/media/series/OnePiece,/mnt/nfs/data/media/metadata"
 export OPDES_ALLOWED_REMOTE_HOSTS="onepace.net,pixeldrain.net,pixeldrain.com,192.168.1.204"
-gunicorn --bind 0.0.0.0:8080 --workers 2 --threads 4 src.opdes_web_app:app
+gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 4 src.opdes_web_app:app
 ```
 
 `OPDES_SECRET_KEY` y una credencial admin son obligatorios cuando `OPDES_ENV=production`.
+
+Usa un solo worker de `gunicorn`: la cola de descargas vive en memoria del proceso. La concurrencia se controla con hilos y `OPDES_MAX_CONCURRENT_DOWNLOADS`.
 
 ## Docker Compose
 
