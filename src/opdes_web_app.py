@@ -1306,7 +1306,7 @@ function _stat(j){
 }
 function _jobRow(id,j){
   const p=_pct(j),s=_stat(j);
-  const cancel='<button class="job-toggle" onclick="_jobCancel(\''+_esc(id)+'\')">Cancelar</button>';
+  const cancel='<button class="job-toggle" onclick="_jobCancel(\\''+_esc(id)+'\\')">Cancelar</button>';
   if(j.files&&j.files.length>0){
     // Season job: header with overall bar, then file list below full-width
     const filesHtml=j.files.map(f=>{
@@ -1353,7 +1353,7 @@ function _render(jobs){
   const lbl=running.length?'⬇ '+running.length+' descarga'+(running.length>1?'s':'')+' activas':(errors.length+' error'+(errors.length>1?'es':''));
   const stopBtn=running.length?'<button class="job-stop" onclick="_cancelAll()">⏹ Detener</button>':'';
   sum.innerHTML='<div class="job-sum-inner"><span class="job-sum-label">'+lbl+'</span>'+(running.length?'<div class="job-prog"><div class="fill" style="width:'+avgPct+'%"></div></div><span class="job-st">'+avgPct+'%'+(sizeStr?' · '+sizeStr:'')+'</span>':'')+errBadge+stopBtn+'<button class="job-toggle" onclick="_toggleJobBar()">'+(_expanded?'▼':'▲')+'</button></div>';
-  det.innerHTML=running.map(([id,j])=>_jobRow(id,j)).join('')+errors.map(([id,j])=>'<div class="job-err">✕ '+_esc(j.label)+': '+_esc(j.msg)+' <button class="job-toggle" onclick="_jobRetry(\''+_esc(id)+'\')">Reintentar</button></div>').join('');
+  det.innerHTML=running.map(([id,j])=>_jobRow(id,j)).join('')+errors.map(([id,j])=>'<div class="job-err">✕ '+_esc(j.label)+': '+_esc(j.msg)+' <button class="job-toggle" onclick="_jobRetry(\\''+_esc(id)+'\\')">Reintentar</button></div>').join('');
   document.querySelectorAll('[data-job-id]').forEach(el=>{
     const j=jobs[el.dataset.jobId];
     if(!j||j.status!=='running')return;
