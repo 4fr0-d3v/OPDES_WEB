@@ -147,3 +147,47 @@ def test_episode_availability_uses_pixeldrain_manifest(tmp_path, monkeypatch):
     )
 
     assert [episode["available"] for episode in detail["episodes"]] == [True, False]
+
+
+def test_job_cancel_and_retry_for_queued_job(isolated_app):
+    webapp.job_create("test-job", "Test job", lambda job_id: None, ())
+
+    with isolated_app.test_client() as client:
+        setup_response = client.get("/setup")
+        token = csrf_from(setup_response.get_data(as_text=True))
+        cancel = client.post("/api/jobs/test-job/cancel", headers={"X-CSRF-Token": token})
+        retry = client.post("/api/jobs/test-job/retry", headers={"X-CSRF-Token": token})
+        jobs = client.get("/api/jobs").get_json()
+
+    assert cancel.status_code == 200
+    assert retry.status_code == 200
+    assert jobs["test-job"]["status"] in {"queued", "running", "done"}
+    assert "_fn" not in jobs["test-job"]
+
+
+def test_bulk_episode_download_endpoint_starts_selected_jobs(isolated_app, monkeypatch):
+    monkeypatch.setattr(
+        webapp,
+        "cargar_detalle_temporada",
+        lambda season, config: {
+            "arc": {"id": "arc", "season_number": season, "season_title": "Arc", "opciones": []},
+            "season_meta": {},
+            "episodes": [
+                {"number": 1, "available": True, "downloaded": False},
+                {"number": 2, "available": False, "downloaded": False},
+                {"number": 3, "available": True, "downloaded": True},
+            ],
+        },
+    )
+
+    with isolated_app.test_client() as client:
+        setup_response = client.get("/setup")
+        token = csrf_from(setup_response.get_data(as_text=True))
+        response = client.post(
+            "/api/download/season/1/episodes",
+            json={"episodes": [1, 2, 3]},
+            headers={"X-CSRF-Token": token},
+        )
+
+    assert response.status_code == 200
+    assert response.get_json()["job_ids"] == ["ep-1-1"]

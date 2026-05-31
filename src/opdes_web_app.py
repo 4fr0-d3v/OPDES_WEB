@@ -73,15 +73,35 @@ app.config.update(
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 _cancel_flags: dict[str, threading.Event] = {}
+_job_queue: list[str] = []
+_job_queue_cv = threading.Condition(_jobs_lock)
+_workers_started = False
 
 
-def job_create(job_id: str, label: str) -> None:
+def max_concurrent_downloads() -> int:
+    raw = os.environ.get("OPDES_MAX_CONCURRENT_DOWNLOADS", "2").strip()
+    try:
+        return max(1, min(8, int(raw)))
+    except ValueError:
+        return 2
+
+
+def _job_terminal(status: str) -> bool:
+    return status in {"done", "error", "cancelled"}
+
+
+def job_create(job_id: str, label: str, fn=None, args: tuple = ()) -> None:
+    now = time.time()
     with _jobs_lock:
         _jobs[job_id] = {
-            "status": "running", "label": label,
+            "status": "queued", "label": label,
             "progress": 0, "total": 0, "msg": "",
             "file_progress": 0, "file_total": 0,
             "files": [], "bytes_progress": 0, "bytes_total": 0,
+            "bytes_per_sec": 0, "eta_seconds": None,
+            "created_at": now, "queued_at": now, "started_at": None,
+            "finished_at": None, "updated_at": now, "last_error": "",
+            "_fn": fn, "_args": args,
         }
     _cancel_flags[job_id] = threading.Event()
 
@@ -93,20 +113,129 @@ def job_cancel_event(job_id: str) -> threading.Event | None:
 def job_update(job_id: str, **kw) -> None:
     with _jobs_lock:
         if job_id in _jobs:
-            _jobs[job_id].update(kw)
+            job = _jobs[job_id]
+            prev_bytes = int(job.get("bytes_progress") or job.get("file_progress") or 0)
+            prev_ts = float(job.get("updated_at") or time.time())
+            now = time.time()
+            job.update(kw)
+            current_bytes = int(job.get("bytes_progress") or job.get("file_progress") or 0)
+            elapsed = max(now - prev_ts, 0.001)
+            delta = current_bytes - prev_bytes
+            if delta > 0:
+                speed = delta / elapsed
+                job["bytes_per_sec"] = speed
+                total = int(job.get("bytes_total") or job.get("file_total") or 0)
+                if total > current_bytes and speed > 0:
+                    job["eta_seconds"] = int((total - current_bytes) / speed)
+            if "status" in kw and kw["status"] == "running" and job.get("started_at") is None:
+                job["started_at"] = now
+            if "status" in kw and _job_terminal(kw["status"]):
+                job["finished_at"] = now
+                if kw["status"] == "error":
+                    job["last_error"] = str(job.get("msg") or "")
+            job["updated_at"] = now
 
 
 def jobs_snapshot() -> dict:
     with _jobs_lock:
-        return {k: dict(v) for k, v in _jobs.items()}
+        snapshot = {}
+        for k, v in _jobs.items():
+            public = {pk: pv for pk, pv in v.items() if not pk.startswith("_")}
+            snapshot[k] = public
+        return snapshot
 
 
 def jobs_clear_done() -> None:
     with _jobs_lock:
-        done = [k for k, v in _jobs.items() if v["status"] in ("done", "error", "cancelled")]
+        done = [k for k, v in _jobs.items() if _job_terminal(v["status"])]
         for k in done:
             del _jobs[k]
             _cancel_flags.pop(k, None)
+
+
+def _job_worker() -> None:
+    while True:
+        with _job_queue_cv:
+            while True:
+                while not _job_queue:
+                    _job_queue_cv.wait()
+                job_id = _job_queue.pop(0)
+                job = _jobs.get(job_id)
+                if job and job.get("status") == "queued":
+                    break
+            fn = job.get("_fn")
+            args = job.get("_args", ())
+            job["status"] = "running"
+            job["started_at"] = time.time()
+            job["updated_at"] = job["started_at"]
+        if fn is None:
+            job_update(job_id, status="error", msg="Job sin función asociada.")
+            continue
+        try:
+            fn(job_id, *args)
+        except Exception as e:
+            job_update(job_id, status="error", msg=str(e))
+
+
+def ensure_job_workers() -> None:
+    global _workers_started
+    with _jobs_lock:
+        if _workers_started:
+            return
+        _workers_started = True
+        worker_count = max_concurrent_downloads()
+    for i in range(worker_count):
+        t = threading.Thread(target=_job_worker, name=f"opdes-job-worker-{i + 1}", daemon=True)
+        t.start()
+
+
+def enqueue_job(job_id: str) -> None:
+    ensure_job_workers()
+    with _job_queue_cv:
+        if job_id not in _job_queue and _jobs.get(job_id, {}).get("status") == "queued":
+            _job_queue.append(job_id)
+            _job_queue_cv.notify()
+
+
+def job_cancel(job_id: str) -> bool:
+    with _job_queue_cv:
+        job = _jobs.get(job_id)
+        if not job:
+            return False
+        if job["status"] == "queued":
+            job["status"] = "cancelled"
+            job["finished_at"] = time.time()
+            job["updated_at"] = job["finished_at"]
+            if job_id in _job_queue:
+                _job_queue.remove(job_id)
+            return True
+        if job["status"] == "running":
+            ev = _cancel_flags.get(job_id)
+            if ev:
+                ev.set()
+            return True
+        return False
+
+
+def job_retry(job_id: str) -> bool:
+    with _job_queue_cv:
+        job = _jobs.get(job_id)
+        if not job or job.get("_fn") is None or not _job_terminal(job["status"]):
+            return False
+        now = time.time()
+        job.update({
+            "status": "queued", "progress": 0, "total": 0, "msg": "",
+            "file_progress": 0, "file_total": 0, "files": [],
+            "bytes_progress": 0, "bytes_total": 0,
+            "bytes_per_sec": 0, "eta_seconds": None,
+            "queued_at": now, "started_at": None, "finished_at": None,
+            "updated_at": now,
+        })
+        _cancel_flags[job_id] = threading.Event()
+        if job_id not in _job_queue:
+            _job_queue.append(job_id)
+        _job_queue_cv.notify()
+        return True
 
 
 # ── Catalog cache ──────────────────────────────────────────────────────────────
@@ -760,13 +889,6 @@ def descargar_archivo_reanudable(
     raise RuntimeError(f"Fallo descargando {file_id}: {ultimo_error}")
 
 
-# ── Background jobs ────────────────────────────────────────────────────────────
-
-def _run_in_thread(job_id: str, fn, *args):
-    t = threading.Thread(target=fn, args=(job_id, *args), daemon=True)
-    t.start()
-
-
 def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
     output_dir = Path(config["output_dir"]).expanduser()
     metadata_dir = Path(config["metadata_dir"]).expanduser()
@@ -895,6 +1017,7 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
     except Exception as e:
         job_update(job_id, status="error", msg=str(e))
         return
+
     existente = archivo_ya_existe_en_destino_final(pd_nombre, output_dir, indice_metadatos, arc["season_number"])
     if existente:
         job_update(job_id, status="done", msg="Episodio ya descargado.")
@@ -1094,6 +1217,7 @@ a{color:inherit;text-decoration:none}
 .ep-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;display:flex;align-items:center;gap:14px;padding:12px 16px;transition:border-color .15s}
 .ep-card:hover{border-color:var(--border);background:var(--surface2)}
 .ep-card.ep-downloaded{border-left:3px solid var(--success)}
+.ep-check{width:18px;height:18px;accent-color:var(--accent);flex-shrink:0}
 .ep-num{font-size:.9rem;font-weight:700;color:var(--muted);min-width:36px;text-align:center;flex-shrink:0}
 .ep-body{flex:1;min-width:0}
 .ep-title{font-size:.875rem;font-weight:600;margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1180,8 +1304,9 @@ function _stat(j){
   if(j.file_total>0)return _fb(j.file_progress)+' / '+_fb(j.file_total);
   return '';
 }
-function _jobRow(j){
+function _jobRow(id,j){
   const p=_pct(j),s=_stat(j);
+  const cancel='<button class="job-toggle" onclick="_jobCancel(\''+_esc(id)+'\')">Cancelar</button>';
   if(j.files&&j.files.length>0){
     // Season job: header with overall bar, then file list below full-width
     const filesHtml=j.files.map(f=>{
@@ -1189,15 +1314,21 @@ function _jobRow(j){
       if(f.progress>0){const fp=f.size>0?Math.round(f.progress/f.size*100):0;return '<div class="jf-row jf-active">⬇ <span class="jf-name">'+_esc(f.name)+'</span><div class="job-prog sm"><div class="fill" style="width:'+fp+'%"></div></div><span class="jf-size">'+_fb(f.progress)+' / '+_fb(f.size)+'</span></div>';}
       return '<div class="jf-row jf-pending">○ <span class="jf-name">'+_esc(f.name)+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
     }).join('');
-    return '<div class="job-card"><div class="job-card-hdr"><span class="job-lbl">'+_esc(j.label)+'</span><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div><div class="job-count">'+j.progress+'/'+j.total+' archivos</div><div class="job-files">'+filesHtml+'</div></div>';
+    return '<div class="job-card"><div class="job-card-hdr"><span class="job-lbl">'+_esc(j.label)+'</span><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(j.status==='queued'?'En cola':(p>0?p+'%':'…')+(s?' · '+s:''))+'</span>'+cancel+'</div><div class="job-count">'+j.progress+'/'+j.total+' archivos</div><div class="job-files">'+filesHtml+'</div></div>';
   }
   // Episode job: simple single row
-  return '<div class="job-row"><div class="job-row-left"><span class="job-lbl">'+_esc(j.label)+'</span></div><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div>';
+  return '<div class="job-row"><div class="job-row-left"><span class="job-lbl">'+_esc(j.label)+'</span></div><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(j.status==='queued'?'En cola':(p>0?p+'%':'…')+(s?' · '+s:''))+'</span>'+cancel+'</div>';
 }
 function _toggleJobBar(){
   _expanded=!_expanded;
   document.getElementById('job-detail').classList.toggle('expanded',_expanded);
   _render(_lastJobs);
+}
+function _jobCancel(id){
+  fetch('/api/jobs/'+encodeURIComponent(id)+'/cancel',{method:'POST',headers:{'X-CSRF-Token':window.OPDES_CSRF_TOKEN||''}}).catch(()=>{});
+}
+function _jobRetry(id){
+  fetch('/api/jobs/'+encodeURIComponent(id)+'/retry',{method:'POST',headers:{'X-CSRF-Token':window.OPDES_CSRF_TOKEN||''}}).catch(()=>{});
 }
 function _cancelAll(){
   fetch('/api/jobs/cancel',{method:'POST',headers:{'X-CSRF-Token':window.OPDES_CSRF_TOKEN||''}}).catch(()=>{});
@@ -1206,10 +1337,10 @@ function _render(jobs){
   _lastJobs=jobs;
   const bar=document.getElementById('job-bar'),sum=document.getElementById('job-summary'),det=document.getElementById('job-detail');
   if(!bar)return;
-  const running=Object.entries(jobs).filter(([,v])=>v.status==='running');
+  const running=Object.entries(jobs).filter(([,v])=>v.status==='running'||v.status==='queued');
   const errors=Object.entries(jobs).filter(([,v])=>v.status==='error');
   if(!running.length&&!errors.length){
-    if(_hadRunning){_hadRunning=false;setTimeout(()=>location.reload(),800);}
+    if(_hadRunning){_hadRunning=false;}
     bar.classList.remove('visible');return;
   }
   _hadRunning=running.length>0;
@@ -1219,10 +1350,10 @@ function _render(jobs){
   const avgPct=totalB>0?Math.round(doneB/totalB*100):(running.length?Math.round(running.reduce((s,[,j])=>s+_pct(j),0)/running.length):0);
   const sizeStr=totalB>0?_fb(doneB)+' / '+_fb(totalB):'';
   const errBadge=errors.length?'<span class="job-err-badge">'+errors.length+' error'+(errors.length>1?'es':'')+'</span>':'';
-  const lbl=running.length?'⬇ '+running.length+' descarga'+(running.length>1?'s':'')+' en curso':(errors.length+' error'+(errors.length>1?'es':''));
+  const lbl=running.length?'⬇ '+running.length+' descarga'+(running.length>1?'s':'')+' activas':(errors.length+' error'+(errors.length>1?'es':''));
   const stopBtn=running.length?'<button class="job-stop" onclick="_cancelAll()">⏹ Detener</button>':'';
   sum.innerHTML='<div class="job-sum-inner"><span class="job-sum-label">'+lbl+'</span>'+(running.length?'<div class="job-prog"><div class="fill" style="width:'+avgPct+'%"></div></div><span class="job-st">'+avgPct+'%'+(sizeStr?' · '+sizeStr:'')+'</span>':'')+errBadge+stopBtn+'<button class="job-toggle" onclick="_toggleJobBar()">'+(_expanded?'▼':'▲')+'</button></div>';
-  det.innerHTML=running.map(([,j])=>_jobRow(j)).join('')+errors.map(([,j])=>'<div class="job-err">✕ '+_esc(j.label)+': '+_esc(j.msg)+'</div>').join('');
+  det.innerHTML=running.map(([id,j])=>_jobRow(id,j)).join('')+errors.map(([id,j])=>'<div class="job-err">✕ '+_esc(j.label)+': '+_esc(j.msg)+' <button class="job-toggle" onclick="_jobRetry(\''+_esc(id)+'\')">Reintentar</button></div>').join('');
   document.querySelectorAll('[data-job-id]').forEach(el=>{
     const j=jobs[el.dataset.jobId];
     if(!j||j.status!=='running')return;
@@ -1232,10 +1363,17 @@ function _render(jobs){
     lbl.textContent=_stat(j)||'…';
   });
   document.querySelectorAll('.season-card[data-season]').forEach(card=>{
-    card.classList.toggle('dl-active',!!(jobs['season-'+card.dataset.season]?.status==='running'));
+    const sj=jobs['season-'+card.dataset.season];
+    card.classList.toggle('dl-active',!!(sj&&(sj.status==='running'||sj.status==='queued')));
   });
 }
-function _poll(){fetch('/api/jobs').then(r=>r.json()).then(_render).catch(()=>{});setTimeout(_poll,2000);}
+function _poll(){
+  fetch('/api/jobs').then(r=>r.json()).then(jobs=>{
+    _render(jobs);
+    const active=Object.values(jobs).some(j=>j.status==='running'||j.status==='queued');
+    setTimeout(_poll,active?1000:15000);
+  }).catch(()=>setTimeout(_poll,15000));
+}
 document.addEventListener('DOMContentLoaded',_poll);
 """
 
@@ -1313,12 +1451,12 @@ def login():
     <form method="post" action="{url_for('login')}">
       {csrf_input()}
       <div class="form-group">
-        <label>Usuario</label>
-        <input name="username" autocomplete="username">
+        <label for="login-username">Usuario</label>
+        <input id="login-username" name="username" autocomplete="username">
       </div>
       <div class="form-group">
-        <label>Contraseña o token admin</label>
-        <input name="password" type="password" autocomplete="current-password">
+        <label for="login-password">Contraseña o token admin</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password">
       </div>
       <div class="card-footer">
         <button class="btn btn-primary" type="submit">Entrar</button>
@@ -1611,12 +1749,23 @@ def api_jobs_clear():
 @app.post("/api/jobs/cancel")
 def api_jobs_cancel():
     with _jobs_lock:
-        running = [jid for jid, j in _jobs.items() if j["status"] == "running"]
-    for jid in running:
-        ev = _cancel_flags.get(jid)
-        if ev:
-            ev.set()
-    return jsonify({"ok": True, "cancelled": running})
+        cancellable = [jid for jid, j in _jobs.items() if j["status"] in {"queued", "running"}]
+    cancelled = [jid for jid in cancellable if job_cancel(jid)]
+    return jsonify({"ok": True, "cancelled": cancelled})
+
+
+@app.post("/api/jobs/<job_id>/cancel")
+def api_job_cancel(job_id: str):
+    if not job_cancel(job_id):
+        return jsonify({"ok": False, "error": "Job no encontrado o no cancelable."}), 404
+    return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.post("/api/jobs/<job_id>/retry")
+def api_job_retry(job_id: str):
+    if not job_retry(job_id):
+        return jsonify({"ok": False, "error": "Job no encontrado o no reintentable."}), 404
+    return jsonify({"ok": True, "job_id": job_id})
 
 
 @app.get("/api/catalog")
@@ -1649,6 +1798,17 @@ def api_download_season(n: int):
 @app.post("/api/download/season/<int:n>/episode/<int:e>")
 def api_download_episode(n: int, e: int):
     return _start_download_episode(n, e, as_json=True)
+
+
+@app.post("/api/download/season/<int:n>/episodes")
+def api_download_episodes(n: int):
+    payload = request.get_json(silent=True) or {}
+    raw_episodes = payload.get("episodes") or request.form.getlist("episodes")
+    try:
+        episodes = sorted({int(e) for e in raw_episodes})
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Lista de episodios no válida."}), 400
+    return _start_download_episodes(n, episodes, as_json=True)
 
 
 @app.post("/api/delete/season/<int:n>")
@@ -1729,41 +1889,41 @@ def setup():
     <form method="post" action="/setup">
       {csrf_input()}
       <div class="form-group">
-        <label>Carpeta de episodios</label>
-        <input name="output_dir" value="{escape(config.get('output_dir',''))}" placeholder="/media/Series/One Pace">
+        <label for="setup-output-dir">Carpeta de episodios</label>
+        <input id="setup-output-dir" name="output_dir" value="{escape(config.get('output_dir',''))}" placeholder="/media/Series/One Pace">
         <div class="form-hint">Aquí se guardarán los vídeos descargados.</div>
       </div>
       <div class="form-group">
-        <label>Carpeta de metadatos</label>
-        <input name="metadata_dir" value="{escape(config.get('metadata_dir',''))}" placeholder="/srv/opdes/metadatos">
+        <label for="setup-metadata-dir">Carpeta de metadatos</label>
+        <input id="setup-metadata-dir" name="metadata_dir" value="{escape(config.get('metadata_dir',''))}" placeholder="/srv/opdes/metadatos">
         <div class="form-hint">NFOs, pósters y carátulas de temporadas y episodios.</div>
       </div>
       <div class="form-group">
-        <label>URL One Pace</label>
-        <input name="url" value="{escape(config.get('url',DEFAULT_CONFIG['url']))}">
+        <label for="setup-url">URL One Pace</label>
+        <input id="setup-url" name="url" value="{escape(config.get('url',DEFAULT_CONFIG['url']))}">
       </div>
       <div class="form-group">
-        <label>Calidad preferida</label>
-        <select name="quality">{opts}</select>
+        <label for="setup-quality">Calidad preferida</label>
+        <select id="setup-quality" name="quality">{opts}</select>
       </div>
       <div class="form-group">
-        <label>URL de Jellyfin</label>
-        <input name="jellyfin_url" value="{escape(config.get('jellyfin_url',''))}" placeholder="http://192.168.1.204:8096">
+        <label for="setup-jellyfin-url">URL de Jellyfin</label>
+        <input id="setup-jellyfin-url" name="jellyfin_url" value="{escape(config.get('jellyfin_url',''))}" placeholder="http://192.168.1.204:8096">
         <div class="form-hint">Para el botón de reproducción directa desde los episodios.</div>
       </div>
       <div class="form-group">
-        <label>API Token de Jellyfin</label>
-        <input name="jellyfin_token" value="" placeholder="Nuevo token de API de Jellyfin" autocomplete="off">
+        <label for="setup-jellyfin-token">API Token de Jellyfin</label>
+        <input id="setup-jellyfin-token" name="jellyfin_token" value="" placeholder="Nuevo token de API de Jellyfin" autocomplete="off">
         <div class="form-hint">{token_status}</div>
       </div>
       <div class="form-group">
-        <label>Usuario de Jellyfin</label>
-        <input name="jellyfin_user" value="{escape(config.get('jellyfin_user',''))}" placeholder="kilian">
+        <label for="setup-jellyfin-user">Usuario de Jellyfin</label>
+        <input id="setup-jellyfin-user" name="jellyfin_user" value="{escape(config.get('jellyfin_user',''))}" placeholder="kilian">
         <div class="form-hint">Nombre de usuario para el estado de visto. Vacío usa el primer administrador.</div>
       </div>
       <div class="form-group">
-        <label>Nombre de la serie en Jellyfin</label>
-        <input name="jellyfin_series" value="{escape(config.get('jellyfin_series', DEFAULT_CONFIG['jellyfin_series']))}">
+        <label for="setup-jellyfin-series">Nombre de la serie en Jellyfin</label>
+        <input id="setup-jellyfin-series" name="jellyfin_series" value="{escape(config.get('jellyfin_series', DEFAULT_CONFIG['jellyfin_series']))}">
         <div class="form-hint">Nombre exacto de la serie tal como aparece en Jellyfin.</div>
       </div>
       <div class="card-footer">
@@ -1865,7 +2025,7 @@ def check_setup():
         validate_csrf()
     if request.endpoint in {"login", "login_submit", "setup", "save_setup", "sync_metadata_route", "img_show_poster",
                              "img_show_backdrop", "img_season_poster", "api_jobs", "api_jobs_clear",
-                             "api_jobs_cancel", "favicon", "static"}:
+                             "api_jobs_cancel", "api_job_cancel", "api_job_retry", "favicon", "static"}:
         return
     config = cargar_config()
     if not config_completa(config):
@@ -1982,7 +2142,7 @@ def season_detail(n: int):
 
     job_id_season = f"season-{n}"
     jobs = jobs_snapshot()
-    season_downloading = job_id_season in jobs and jobs[job_id_season]["status"] == "running"
+    season_downloading = job_id_season in jobs and jobs[job_id_season]["status"] in {"queued", "running"}
 
     content = f"""
 <a class="back-link" href="/">← Biblioteca</a>
@@ -2006,6 +2166,12 @@ def season_detail(n: int):
   </div>
 </div>
 <div class="ep-section-header">Episodios</div>
+<form id="bulk-download" method="post" action="/download/season/{n}/episodes" style="display:none">
+{csrf_input()}
+</form>
+<div class="card-footer" style="margin:0 0 12px 0">
+  <button class="btn btn-primary btn-sm" type="submit" form="bulk-download">Descargar seleccionados</button>
+</div>
 <div class="ep-list">
 {"<p style='color:var(--muted);font-size:.875rem;padding:16px 0'>No hay metadatos disponibles para esta temporada. Sincroniza los metadatos.</p>" if not episodes else ""}
 """
@@ -2019,7 +2185,7 @@ def season_detail(n: int):
         available = ep["available"]
 
         ep_job_id = f"ep-{n}-{en}"
-        ep_downloading = ep_job_id in jobs and jobs[ep_job_id]["status"] == "running"
+        ep_downloading = ep_job_id in jobs and jobs[ep_job_id]["status"] in {"queued", "running"}
 
         badge = '<span class="ep-badge ok">✓ Descargado</span>' if downloaded else '<span class="ep-badge pending">Sin descargar</span>'
 
@@ -2050,6 +2216,12 @@ def season_detail(n: int):
         else:
             action = '<span class="no-av">No disponible</span>'
 
+        checkbox = (
+            f'<input class="ep-check" form="bulk-download" type="checkbox" name="episodes" value="{en}" aria-label="Seleccionar episodio {en}">'
+            if available and not downloaded and not ep_downloading else
+            '<span style="width:18px;flex-shrink:0"></span>'
+        )
+
         meta_parts = []
         if ep_aired:
             meta_parts.append(ep_aired)
@@ -2057,6 +2229,7 @@ def season_detail(n: int):
 
         content += f"""
   <div class="ep-card {"ep-downloaded" if downloaded else ""}">
+    {checkbox}
     <div class="ep-num">E{en:02d}</div>
     <div class="ep-body">
       <div class="ep-title">{escape(et)}</div>
@@ -2082,13 +2255,13 @@ def _start_download_season(n: int, *, as_json: bool = False):
         return redirect(url_for("home"))
     job_id = f"season-{n}"
     jobs = jobs_snapshot()
-    if job_id in jobs and jobs[job_id]["status"] == "running":
+    if job_id in jobs and jobs[job_id]["status"] in {"queued", "running"}:
         if as_json:
             return jsonify({"ok": True, "job_id": job_id, "already_running": True})
         flash("La temporada ya se está descargando.")
         return redirect(url_for("season_detail", n=n))
-    job_create(job_id, f"T{n}: {arc.get('season_title', arc['id'])}")
-    _run_in_thread(job_id, descargar_temporada_bg, arc, config)
+    job_create(job_id, f"T{n}: {arc.get('season_title', arc['id'])}", descargar_temporada_bg, (arc, config))
+    enqueue_job(job_id)
     if as_json:
         return jsonify({"ok": True, "job_id": job_id})
     flash(f"Descarga de la temporada {n} iniciada en segundo plano.")
@@ -2105,17 +2278,55 @@ def _start_download_episode(n: int, e: int, *, as_json: bool = False):
         return redirect(url_for("home"))
     job_id = f"ep-{n}-{e}"
     jobs = jobs_snapshot()
-    if job_id in jobs and jobs[job_id]["status"] == "running":
+    if job_id in jobs and jobs[job_id]["status"] in {"queued", "running"}:
         if as_json:
             return jsonify({"ok": True, "job_id": job_id, "already_running": True})
         flash("El episodio ya se está descargando.")
         return redirect(url_for("season_detail", n=n))
     title = arc.get("season_title", arc["id"])
-    job_create(job_id, f"T{n} E{e:02d} — {title}")
-    _run_in_thread(job_id, descargar_episodio_bg, arc, e, config)
+    job_create(job_id, f"T{n} E{e:02d} - {title}", descargar_episodio_bg, (arc, e, config))
+    enqueue_job(job_id)
     if as_json:
         return jsonify({"ok": True, "job_id": job_id})
     flash(f"Descarga del episodio {e} iniciada en segundo plano.")
+    return redirect(url_for("season_detail", n=n))
+
+
+def _start_download_episodes(n: int, episodes: list[int], *, as_json: bool = False):
+    if not episodes:
+        if as_json:
+            return jsonify({"ok": False, "error": "Selecciona al menos un episodio."}), 400
+        flash("Selecciona al menos un episodio.", "error")
+        return redirect(url_for("season_detail", n=n))
+    config = cargar_config()
+    detail = cargar_detalle_temporada(n, config)
+    if not detail:
+        if as_json:
+            return jsonify({"ok": False, "error": "Temporada no encontrada."}), 404
+        flash("Temporada no encontrada.")
+        return redirect(url_for("home"))
+    valid = {ep["number"] for ep in detail["episodes"] if ep["available"] and not ep["downloaded"]}
+    selected = [ep for ep in episodes if ep in valid]
+    if not selected:
+        if as_json:
+            return jsonify({"ok": False, "error": "No hay episodios seleccionados descargables."}), 400
+        flash("No hay episodios seleccionados descargables.", "error")
+        return redirect(url_for("season_detail", n=n))
+    arc = detail["arc"]
+    job_ids = []
+    for episode in selected:
+        job_id = f"ep-{n}-{episode}"
+        jobs = jobs_snapshot()
+        if job_id in jobs and jobs[job_id]["status"] in {"queued", "running"}:
+            job_ids.append(job_id)
+            continue
+        title = arc.get("season_title", arc["id"])
+        job_create(job_id, f"T{n} E{episode:02d} - {title}", descargar_episodio_bg, (arc, episode, config))
+        enqueue_job(job_id)
+        job_ids.append(job_id)
+    if as_json:
+        return jsonify({"ok": True, "job_ids": job_ids})
+    flash(f"Iniciadas {len(job_ids)} descarga(s).")
     return redirect(url_for("season_detail", n=n))
 
 
@@ -2166,6 +2377,15 @@ def download_season(n: int):
 @app.post("/download/season/<int:n>/episode/<int:e>")
 def download_episode(n: int, e: int):
     return _start_download_episode(n, e)
+
+
+@app.post("/download/season/<int:n>/episodes")
+def download_episodes(n: int):
+    try:
+        episodes = sorted({int(e) for e in request.form.getlist("episodes")})
+    except ValueError:
+        episodes = []
+    return _start_download_episodes(n, episodes)
 
 
 @app.post("/delete/season/<int:n>")
