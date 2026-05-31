@@ -1,0 +1,19 @@
+services:
+  opdes-web:
+    build: .
+    ports:
+      - "8081:8080"
+    environment:
+      OPDES_ENV: production
+      OPDES_SECRET_KEY: "change-me"
+      OPDES_ADMIN_USER: "admin"
+      OPDES_ADMIN_PASSWORD_HASH: "generate-with-werkzeug"
+      OPDES_ALLOWED_PATHS: "/media,/metadata"
+      OPDES_ALLOWED_REMOTE_HOSTS: "onepace.net,pixeldrain.net,pixeldrain.com,192.168.1.204"
+    volumes:
+      - opdes-config:/root/.opdes
+      - /mnt/nfs/data/media/series/OnePiece:/media
+      - /mnt/nfs/data/media/metadata:/metadata
+
+volumes:
+  opdes-config:

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import hmac
+import ipaddress
+import os
 import re
+import secrets
 import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -14,11 +19,13 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, redirect, render_template_string, request, send_file, url_for, flash
+from flask import Flask, abort, flash, jsonify, redirect, render_template_string, request, send_file, session, url_for
+from markupsafe import escape
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ChunkedEncodingError, ConnectionError, HTTPError, RequestException, Timeout
 from tqdm import tqdm
 from urllib3.util.retry import Retry
+from werkzeug.security import check_password_hash
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".opdes"
@@ -44,7 +51,23 @@ METADATA_SOURCE_SUFFIX = "one-pace-jellyfin-master/One Pace"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov"}
 
 app = Flask(__name__)
-app.secret_key = "opdes-local-dev"
+
+
+def _load_secret_key() -> str:
+    secret_key = os.environ.get("OPDES_SECRET_KEY", "").strip()
+    if secret_key:
+        return secret_key
+    if os.environ.get("OPDES_ENV", "development").lower() == "production":
+        raise RuntimeError("OPDES_SECRET_KEY es obligatorio en OPDES_ENV=production.")
+    return secrets.token_hex(32)
+
+
+app.secret_key = _load_secret_key()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("OPDES_SESSION_SECURE", "").lower() in {"1", "true", "yes"},
+)
 
 # ── Job tracking ───────────────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -128,6 +151,139 @@ def metadatos_ok(config: dict) -> bool:
     return p.exists() and bool(list(p.glob("Season *")))
 
 
+# ── Security helpers ───────────────────────────────────────────────────────────
+
+PUBLIC_ENDPOINTS = {"login", "login_submit", "favicon", "static"}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def env_list(name: str) -> list[str]:
+    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+
+
+def admin_auth_configured() -> bool:
+    return bool(
+        os.environ.get("OPDES_ADMIN_TOKEN", "").strip()
+        or (
+            os.environ.get("OPDES_ADMIN_USER", "").strip()
+            and os.environ.get("OPDES_ADMIN_PASSWORD_HASH", "").strip()
+        )
+    )
+
+
+def auth_required() -> bool:
+    return admin_auth_configured() or os.environ.get("OPDES_ENV", "development").lower() == "production"
+
+
+def is_authenticated() -> bool:
+    return bool(session.get("opdes_admin_authenticated"))
+
+
+def csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return token
+
+
+def csrf_input() -> str:
+    return f'<input type="hidden" name="csrf_token" value="{escape(csrf_token())}">'
+
+
+def validate_csrf() -> None:
+    expected = session.get("_csrf_token")
+    supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "")
+    if not expected or not hmac.compare_digest(str(expected), str(supplied)):
+        abort(400, "CSRF token inválido.")
+
+
+def wants_json_response() -> bool:
+    return request.path.startswith("/api/") or request.accept_mimetypes.best == "application/json"
+
+
+def validate_login(username: str, password: str) -> bool:
+    admin_token = os.environ.get("OPDES_ADMIN_TOKEN", "").strip()
+    if admin_token and hmac.compare_digest(password, admin_token):
+        return True
+    admin_user = os.environ.get("OPDES_ADMIN_USER", "").strip()
+    password_hash = os.environ.get("OPDES_ADMIN_PASSWORD_HASH", "").strip()
+    if admin_user and password_hash and hmac.compare_digest(username, admin_user):
+        return check_password_hash(password_hash, password)
+    return False
+
+
+def ensure_auth_is_configured() -> None:
+    if os.environ.get("OPDES_ENV", "development").lower() == "production" and not admin_auth_configured():
+        raise RuntimeError("Configura OPDES_ADMIN_TOKEN o OPDES_ADMIN_USER/OPDES_ADMIN_PASSWORD_HASH en producción.")
+
+
+def is_private_or_loopback_host(host: str) -> bool:
+    if not host:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except ValueError:
+        pass
+    try:
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return True
+    except socket.gaierror:
+        return False
+    return False
+
+
+def validate_remote_url(raw_url: str, *, allow_private: bool = False) -> str:
+    value = raw_url.strip().rstrip("/")
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("La URL debe usar http:// o https:// y tener host.")
+    allowed_hosts = set(env_list("OPDES_ALLOWED_REMOTE_HOSTS"))
+    host = (parsed.hostname or "").lower()
+    if allowed_hosts and host not in allowed_hosts:
+        raise ValueError(f"Host remoto no permitido: {host}")
+    if not allow_private and not allowed_hosts and is_private_or_loopback_host(host):
+        raise ValueError("Host privado bloqueado. Añádelo a OPDES_ALLOWED_REMOTE_HOSTS si es esperado.")
+    return value
+
+
+def allowed_path_roots() -> list[Path]:
+    roots = env_list("OPDES_ALLOWED_PATHS")
+    if not roots:
+        return []
+    return [Path(p).expanduser().resolve() for p in roots]
+
+
+def validate_config_path(raw_path: str, field_name: str) -> str:
+    value = raw_path.strip()
+    if not value:
+        return ""
+    resolved = Path(value).expanduser().resolve()
+    dangerous = {Path("/"), Path.home().resolve()}
+    if resolved in dangerous:
+        raise ValueError(f"{field_name} no puede apuntar a {resolved}.")
+    roots = allowed_path_roots()
+    if roots and not any(resolved == root or root in resolved.parents for root in roots):
+        allowed = ", ".join(str(root) for root in roots)
+        raise ValueError(f"{field_name} debe estar dentro de: {allowed}")
+    return str(resolved)
+
+
+def safe_extract_zip(zf: zipfile.ZipFile, destination: Path) -> None:
+    destination = destination.resolve()
+    for member in zf.infolist():
+        member_path = destination / member.filename
+        resolved = member_path.resolve()
+        if resolved != destination and destination not in resolved.parents:
+            raise RuntimeError(f"ZIP inseguro: {member.filename}")
+    zf.extractall(destination)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def slugify(value: str) -> str:
@@ -150,6 +306,7 @@ def copiar_contenido_directorio(origen: Path, destino: Path) -> None:
 # ── Network ────────────────────────────────────────────────────────────────────
 
 def obtener_html(url: str) -> str:
+    url = validate_remote_url(url)
     ultimo_error = None
     for intento in range(1, 6):
         try:
@@ -218,6 +375,9 @@ def elegir_opcion_por_calidad(opciones: list[dict], quality_config: str) -> dict
 
 def extraer_tipo_e_id(url: str):
     parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or host not in API_HOSTS:
+        raise ValueError(f"URL de Pixeldrain no soportada: {url}")
     path = parsed.path.strip("/")
     partes = path.split("/")
     if len(partes) >= 2:
@@ -230,10 +390,10 @@ def extraer_tipo_e_id(url: str):
 
 
 def hosts_preferidos_desde_url(url: str):
-    host = urlparse(url).netloc.lower()
-    if "pixeldrain.net" in host:
+    host = (urlparse(url).hostname or "").lower()
+    if host == "pixeldrain.net":
         return ["pixeldrain.net", "pixeldrain.com"]
-    if "pixeldrain.com" in host:
+    if host == "pixeldrain.com":
         return ["pixeldrain.com", "pixeldrain.net"]
     return API_HOSTS[:]
 
@@ -305,7 +465,7 @@ def sync_metadata(config: dict) -> None:
                     if chunk:
                         f.write(chunk)
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
+            safe_extract_zip(zf, extract_dir)
         source_dir = None
         for candidate in extract_dir.rglob("One Pace"):
             if candidate.as_posix().endswith(METADATA_SOURCE_SUFFIX):
@@ -816,6 +976,9 @@ a{color:inherit;text-decoration:none}
 .nav-links a{padding:6px 14px;border-radius:8px;font-size:.875rem;color:var(--muted);transition:background .15s,color .15s}
 .nav-links a:hover{background:var(--surface2);color:var(--text)}
 .nav-links a.active{background:var(--accent-dim);color:var(--accent)}
+.nav-form-link{padding:6px 14px;border-radius:8px;font-size:.875rem;color:var(--muted);transition:background .15s,color .15s;background:transparent;border:0;cursor:pointer;font-family:inherit}
+.nav-form-link:hover{background:var(--surface2);color:var(--text)}
+.nav-form-link.active{background:var(--accent-dim);color:var(--accent)}
 
 /* Flash */
 .flash-wrap{padding:12px 24px 0}
@@ -867,8 +1030,8 @@ a{color:inherit;text-decoration:none}
 .season-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:transform .2s,border-color .2s;display:block;cursor:pointer}
 .season-card:hover{transform:translateY(-4px);border-color:var(--accent)}
 .season-card .poster-wrap{position:relative;aspect-ratio:2/3;background:var(--surface2);overflow:hidden}
-.season-card .poster-wrap img{width:100%;height:100%;object-fit:cover;display:block}
-.season-card .poster-wrap .no-poster{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:2.5rem;color:var(--muted)}
+.season-card .poster-wrap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
+.season-card .poster-wrap .no-poster{position:absolute;inset:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:2rem;font-weight:700;color:var(--muted)}
 .season-card .poster-wrap .status-dot{position:absolute;top:8px;right:8px;width:10px;height:10px;border-radius:50%;border:2px solid var(--surface)}
 .status-dot.full{background:var(--success)}
 .status-dot.partial{background:var(--accent)}
@@ -976,6 +1139,7 @@ a{color:inherit;text-decoration:none}
 
 JS = """
 let _hadRunning=false,_expanded=false,_lastJobs={};
+function _esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function _fb(b){if(!b||b<1)return'';if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
 function _pct(j){
   if(j.bytes_total>0)return Math.round(j.bytes_progress/j.bytes_total*100);
@@ -992,14 +1156,14 @@ function _jobRow(j){
   if(j.files&&j.files.length>0){
     // Season job: header with overall bar, then file list below full-width
     const filesHtml=j.files.map(f=>{
-      if(f.done)return '<div class="jf-row jf-done">✓ <span class="jf-name">'+f.name+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
-      if(f.progress>0){const fp=f.size>0?Math.round(f.progress/f.size*100):0;return '<div class="jf-row jf-active">⬇ <span class="jf-name">'+f.name+'</span><div class="job-prog sm"><div class="fill" style="width:'+fp+'%"></div></div><span class="jf-size">'+_fb(f.progress)+' / '+_fb(f.size)+'</span></div>';}
-      return '<div class="jf-row jf-pending">○ <span class="jf-name">'+f.name+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
+      if(f.done)return '<div class="jf-row jf-done">✓ <span class="jf-name">'+_esc(f.name)+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
+      if(f.progress>0){const fp=f.size>0?Math.round(f.progress/f.size*100):0;return '<div class="jf-row jf-active">⬇ <span class="jf-name">'+_esc(f.name)+'</span><div class="job-prog sm"><div class="fill" style="width:'+fp+'%"></div></div><span class="jf-size">'+_fb(f.progress)+' / '+_fb(f.size)+'</span></div>';}
+      return '<div class="jf-row jf-pending">○ <span class="jf-name">'+_esc(f.name)+'</span><span class="jf-size">'+_fb(f.size)+'</span></div>';
     }).join('');
-    return '<div class="job-card"><div class="job-card-hdr"><span class="job-lbl">'+j.label+'</span><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div><div class="job-count">'+j.progress+'/'+j.total+' archivos</div><div class="job-files">'+filesHtml+'</div></div>';
+    return '<div class="job-card"><div class="job-card-hdr"><span class="job-lbl">'+_esc(j.label)+'</span><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div><div class="job-count">'+j.progress+'/'+j.total+' archivos</div><div class="job-files">'+filesHtml+'</div></div>';
   }
   // Episode job: simple single row
-  return '<div class="job-row"><div class="job-row-left"><span class="job-lbl">'+j.label+'</span></div><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div>';
+  return '<div class="job-row"><div class="job-row-left"><span class="job-lbl">'+_esc(j.label)+'</span></div><div class="job-prog"><div class="fill" style="width:'+p+'%"></div></div><span class="job-st">'+(p>0?p+'%':'…')+(s?' · '+s:'')+'</span></div>';
 }
 function _toggleJobBar(){
   _expanded=!_expanded;
@@ -1007,7 +1171,7 @@ function _toggleJobBar(){
   _render(_lastJobs);
 }
 function _cancelAll(){
-  fetch('/api/jobs/cancel',{method:'POST'}).catch(()=>{});
+  fetch('/api/jobs/cancel',{method:'POST',headers:{'X-CSRF-Token':window.OPDES_CSRF_TOKEN||''}}).catch(()=>{});
 }
 function _render(jobs){
   _lastJobs=jobs;
@@ -1029,7 +1193,7 @@ function _render(jobs){
   const lbl=running.length?'⬇ '+running.length+' descarga'+(running.length>1?'s':'')+' en curso':(errors.length+' error'+(errors.length>1?'es':''));
   const stopBtn=running.length?'<button class="job-stop" onclick="_cancelAll()">⏹ Detener</button>':'';
   sum.innerHTML='<div class="job-sum-inner"><span class="job-sum-label">'+lbl+'</span>'+(running.length?'<div class="job-prog"><div class="fill" style="width:'+avgPct+'%"></div></div><span class="job-st">'+avgPct+'%'+(sizeStr?' · '+sizeStr:'')+'</span>':'')+errBadge+stopBtn+'<button class="job-toggle" onclick="_toggleJobBar()">'+(_expanded?'▼':'▲')+'</button></div>';
-  det.innerHTML=running.map(([,j])=>_jobRow(j)).join('')+errors.map(([,j])=>'<div class="job-err">✕ '+j.label+': '+j.msg+'</div>').join('');
+  det.innerHTML=running.map(([,j])=>_jobRow(j)).join('')+errors.map(([,j])=>'<div class="job-err">✕ '+_esc(j.label)+': '+_esc(j.msg)+'</div>').join('');
   document.querySelectorAll('[data-job-id]').forEach(el=>{
     const j=jobs[el.dataset.jobId];
     if(!j||j.status!=='running')return;
@@ -1048,7 +1212,7 @@ document.addEventListener('DOMContentLoaded',_poll);
 
 
 def render(template: str, **ctx) -> str:
-    return render_template_string(template, css=CSS, js=JS, **ctx)
+    return render_template_string(template, css=CSS, js=JS, csrf_token=csrf_token(), csrf_input=csrf_input, **ctx)
 
 
 # ── Templates ──────────────────────────────────────────────────────────────────
@@ -1071,7 +1235,8 @@ LAYOUT = """<!doctype html>
   <div class="nav-links">
     <a href="{{ url_for('home') }}" {% if active=='home' %}class="active"{% endif %}>Biblioteca</a>
     <a href="{{ url_for('setup') }}" {% if active=='setup' %}class="active"{% endif %}>Configuración</a>
-    <a href="{{ url_for('sync_metadata_route') }}" {% if active=='sync' %}class="active"{% endif %}>Sincronizar</a>
+    <form method="post" action="{{ url_for('sync_metadata_route') }}" style="display:inline">{{ csrf_input()|safe }}<button class="nav-form-link {% if active=='sync' %}active{% endif %}" type="submit">Sincronizar</button></form>
+    {% if session.get('opdes_admin_authenticated') %}<a href="{{ url_for('logout') }}">Salir</a>{% endif %}
   </div>
 </nav>
 {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}
@@ -1080,6 +1245,7 @@ LAYOUT = """<!doctype html>
 </div>{% endif %}{% endwith %}
 <div class="main">{{ content|safe }}</div>
 <div id="job-bar"><div id="job-detail"></div><div id="job-summary" onclick="_toggleJobBar()"></div></div>
+<script>window.OPDES_CSRF_TOKEN={{ csrf_token|tojson }};</script>
 <script>{{ js|safe }}</script>
 </body>
 </html>"""
@@ -1087,6 +1253,74 @@ LAYOUT = """<!doctype html>
 
 def page(content: str, title: str = "ONE PACE DES", active: str = "") -> str:
     return render(LAYOUT, content=content, active=active, page_title=title)
+
+
+# ── Auth / request guards ──────────────────────────────────────────────────────
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; "
+        "base-uri 'self'; form-action 'self'",
+    )
+    return response
+
+
+@app.get("/login")
+def login():
+    if not auth_required() or is_authenticated():
+        return redirect(url_for("home"))
+    content = f"""
+<div class="wizard">
+  <div class="wizard-hero">
+    <h1>OPDES Web</h1>
+    <p>Acceso administrativo</p>
+  </div>
+  <div class="card">
+    <form method="post" action="{url_for('login')}">
+      {csrf_input()}
+      <div class="form-group">
+        <label>Usuario</label>
+        <input name="username" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label>Contraseña o token admin</label>
+        <input name="password" type="password" autocomplete="current-password">
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary" type="submit">Entrar</button>
+      </div>
+    </form>
+  </div>
+</div>
+"""
+    return page(content, title="Login", active="")
+
+
+@app.post("/login")
+def login_submit():
+    if not auth_required():
+        return redirect(url_for("home"))
+    validate_csrf()
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    if validate_login(username, password):
+        session.clear()
+        session["opdes_admin_authenticated"] = True
+        csrf_token()
+        return redirect(url_for("home"))
+    flash("Credenciales inválidas.", "error")
+    return redirect(url_for("login"))
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # ── Jellyfin integration ───────────────────────────────────────────────────────
@@ -1237,6 +1471,41 @@ def jellyfin_find_episode(season: int, episode: int, config: dict) -> str | None
     return ep_data["id"] if ep_data else None
 
 
+def _toggle_jellyfin_watched(season: int, episode: int, *, as_json: bool = False):
+    config = cargar_config()
+    jellyfin_url = str(config.get("jellyfin_url", "")).rstrip("/")
+    token = str(config.get("jellyfin_token", "")).strip()
+    if not jellyfin_url or not token:
+        if as_json:
+            return jsonify({"ok": False, "error": "Configura Jellyfin primero."}), 400
+        flash("Configura Jellyfin primero.")
+        return redirect(url_for("setup"))
+    user_id = jellyfin_get_user_id(config)
+    jf_data = jellyfin_season_data(season, config)
+    ep_data = jf_data.get(episode)
+    if not ep_data or not user_id:
+        msg = f"Episodio S{season:02d}E{episode:02d} no encontrado en Jellyfin."
+        if as_json:
+            return jsonify({"ok": False, "error": msg}), 404
+        flash(msg)
+        return redirect(url_for("season_detail", n=season))
+    item_id = ep_data["id"]
+    played = ep_data["played"]
+    headers = {"X-Emby-Authorization": f'MediaBrowser Token="{token}"'}
+    try:
+        if played:
+            requests.delete(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
+        else:
+            requests.post(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
+    except Exception:
+        if as_json:
+            return jsonify({"ok": False, "error": "Error al actualizar el estado en Jellyfin."}), 502
+        flash("Error al actualizar el estado en Jellyfin.")
+    if as_json:
+        return jsonify({"ok": True, "played": not played})
+    return redirect(url_for("season_detail", n=season))
+
+
 # ── Image routes ───────────────────────────────────────────────────────────────
 
 @app.get("/favicon.svg")
@@ -1321,6 +1590,53 @@ def api_jobs_cancel():
     return jsonify({"ok": True, "cancelled": running})
 
 
+@app.get("/api/catalog")
+def api_catalog():
+    config = cargar_config()
+    try:
+        return jsonify({"ok": True, "catalog": cargar_catalogo(config)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/season/<int:n>")
+def api_season(n: int):
+    config = cargar_config()
+    try:
+        detalle = cargar_detalle_temporada(n, config)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    if not detalle:
+        return jsonify({"ok": False, "error": "Temporada no encontrada."}), 404
+    detalle["season_meta"] = None
+    return jsonify({"ok": True, "season": detalle})
+
+
+@app.post("/api/download/season/<int:n>")
+def api_download_season(n: int):
+    return _start_download_season(n, as_json=True)
+
+
+@app.post("/api/download/season/<int:n>/episode/<int:e>")
+def api_download_episode(n: int, e: int):
+    return _start_download_episode(n, e, as_json=True)
+
+
+@app.post("/api/delete/season/<int:n>")
+def api_delete_season(n: int):
+    return _delete_season(n, as_json=True)
+
+
+@app.post("/api/delete/season/<int:n>/episode/<int:e>")
+def api_delete_episode(n: int, e: int):
+    return _delete_episode(n, e, as_json=True)
+
+
+@app.post("/api/jellyfin/watched/<int:season>/<int:episode>")
+def api_jellyfin_toggle_watched(season: int, episode: int):
+    return _toggle_jellyfin_watched(season, episode, as_json=True)
+
+
 @app.get("/jellyfin/play/<int:season>/<int:episode>")
 def jellyfin_play(season: int, episode: int):
     config = cargar_config()
@@ -1336,29 +1652,7 @@ def jellyfin_play(season: int, episode: int):
 
 @app.post("/jellyfin/watched/<int:season>/<int:episode>")
 def jellyfin_toggle_watched(season: int, episode: int):
-    config = cargar_config()
-    jellyfin_url = str(config.get("jellyfin_url", "")).rstrip("/")
-    token = str(config.get("jellyfin_token", "")).strip()
-    if not jellyfin_url or not token:
-        flash("Configura Jellyfin primero.")
-        return redirect(url_for("setup"))
-    user_id = jellyfin_get_user_id(config)
-    jf_data = jellyfin_season_data(season, config)
-    ep_data = jf_data.get(episode)
-    if not ep_data or not user_id:
-        flash(f"Episodio S{season:02d}E{episode:02d} no encontrado en Jellyfin.")
-        return redirect(url_for("season_detail", n=season))
-    item_id = ep_data["id"]
-    played = ep_data["played"]
-    headers = {"X-Emby-Authorization": f'MediaBrowser Token="{token}"'}
-    try:
-        if played:
-            requests.delete(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
-        else:
-            requests.post(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
-    except Exception:
-        flash("Error al actualizar el estado en Jellyfin.")
-    return redirect(url_for("season_detail", n=season))
+    return _toggle_jellyfin_watched(season, episode)
 
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
@@ -1397,25 +1691,27 @@ def setup():
         f'<option value="{v}" {"selected" if q == v else ""}>{v}</option>'
         for v in ["max", "1080p", "720p", "480p"]
     )
+    token_status = "Token configurado. Déjalo vacío para conservarlo." if config.get("jellyfin_token") else "Pega un token nuevo para activar Jellyfin."
 
     html += f"""
   <div class="card">
     <h2>{step1_num} Directorios y calidad</h2>
     {errors_html}
     <form method="post" action="/setup">
+      {csrf_input()}
       <div class="form-group">
         <label>Carpeta de episodios</label>
-        <input name="output_dir" value="{config.get('output_dir','')}" placeholder="/media/Series/One Pace">
+        <input name="output_dir" value="{escape(config.get('output_dir',''))}" placeholder="/media/Series/One Pace">
         <div class="form-hint">Aquí se guardarán los vídeos descargados.</div>
       </div>
       <div class="form-group">
         <label>Carpeta de metadatos</label>
-        <input name="metadata_dir" value="{config.get('metadata_dir','')}" placeholder="/srv/opdes/metadatos">
+        <input name="metadata_dir" value="{escape(config.get('metadata_dir',''))}" placeholder="/srv/opdes/metadatos">
         <div class="form-hint">NFOs, pósters y carátulas de temporadas y episodios.</div>
       </div>
       <div class="form-group">
         <label>URL One Pace</label>
-        <input name="url" value="{config.get('url',DEFAULT_CONFIG['url'])}">
+        <input name="url" value="{escape(config.get('url',DEFAULT_CONFIG['url']))}">
       </div>
       <div class="form-group">
         <label>Calidad preferida</label>
@@ -1423,22 +1719,22 @@ def setup():
       </div>
       <div class="form-group">
         <label>URL de Jellyfin</label>
-        <input name="jellyfin_url" value="{config.get('jellyfin_url','')}" placeholder="http://192.168.1.204:8096">
+        <input name="jellyfin_url" value="{escape(config.get('jellyfin_url',''))}" placeholder="http://192.168.1.204:8096">
         <div class="form-hint">Para el botón de reproducción directa desde los episodios.</div>
       </div>
       <div class="form-group">
         <label>API Token de Jellyfin</label>
-        <input name="jellyfin_token" value="{config.get('jellyfin_token','')}" placeholder="Token de API de Jellyfin">
-        <div class="form-hint">Dashboard → API Keys → Nueva clave.</div>
+        <input name="jellyfin_token" value="" placeholder="Nuevo token de API de Jellyfin" autocomplete="off">
+        <div class="form-hint">{token_status}</div>
       </div>
       <div class="form-group">
         <label>Usuario de Jellyfin</label>
-        <input name="jellyfin_user" value="{config.get('jellyfin_user','')}" placeholder="kilian">
+        <input name="jellyfin_user" value="{escape(config.get('jellyfin_user',''))}" placeholder="kilian">
         <div class="form-hint">Nombre de usuario para el estado de visto. Vacío usa el primer administrador.</div>
       </div>
       <div class="form-group">
         <label>Nombre de la serie en Jellyfin</label>
-        <input name="jellyfin_series" value="{config.get('jellyfin_series', DEFAULT_CONFIG['jellyfin_series'])}">
+        <input name="jellyfin_series" value="{escape(config.get('jellyfin_series', DEFAULT_CONFIG['jellyfin_series']))}">
         <div class="form-hint">Nombre exacto de la serie tal como aparece en Jellyfin.</div>
       </div>
       <div class="card-footer">
@@ -1451,9 +1747,9 @@ def setup():
     # Step 2 – Metadatos
     if step1_done:
         step2_num = '<span class="step-num done">✓</span>' if step2_done else '<span class="step-num">2</span>'
-        sync_btn = '<a class="btn btn-primary" href="/sync-metadata">Descargar metadatos</a>'
+        sync_btn = f'<form method="post" action="/sync-metadata" style="display:inline">{csrf_input()}<button class="btn btn-primary" type="submit">Descargar metadatos</button></form>'
         if step2_done:
-            sync_btn = '<a class="btn btn-ghost" href="/sync-metadata">Actualizar metadatos</a>'
+            sync_btn = f'<form method="post" action="/sync-metadata" style="display:inline">{csrf_input()}<button class="btn btn-ghost" type="submit">Actualizar metadatos</button></form>'
         html += f"""
   <div class="card">
     <h2>{step2_num} Metadatos de One Pace</h2>
@@ -1481,14 +1777,30 @@ def setup():
 @app.post("/setup")
 def save_setup():
     config = cargar_config()
-    config["url"] = request.form.get("url", DEFAULT_CONFIG["url"]).strip() or DEFAULT_CONFIG["url"]
-    config["output_dir"] = request.form.get("output_dir", "").strip()
-    config["metadata_dir"] = request.form.get("metadata_dir", "").strip()
-    config["quality"] = request.form.get("quality", "max").strip().lower() or "max"
-    config["jellyfin_url"] = request.form.get("jellyfin_url", "").strip().rstrip("/")
-    config["jellyfin_token"] = request.form.get("jellyfin_token", "").strip()
-    config["jellyfin_user"] = request.form.get("jellyfin_user", "").strip()
-    config["jellyfin_series"] = request.form.get("jellyfin_series", DEFAULT_CONFIG["jellyfin_series"]).strip() or DEFAULT_CONFIG["jellyfin_series"]
+    try:
+        new_config = dict(config)
+        new_config["url"] = validate_remote_url(
+            request.form.get("url", DEFAULT_CONFIG["url"]).strip() or DEFAULT_CONFIG["url"]
+        )
+        new_config["output_dir"] = validate_config_path(request.form.get("output_dir", ""), "Carpeta de episodios")
+        new_config["metadata_dir"] = validate_config_path(request.form.get("metadata_dir", ""), "Carpeta de metadatos")
+        quality = request.form.get("quality", "max").strip().lower() or "max"
+        if quality not in {"max", "1080p", "720p", "480p"}:
+            raise ValueError("Calidad no válida.")
+        new_config["quality"] = quality
+        new_config["jellyfin_url"] = validate_remote_url(request.form.get("jellyfin_url", ""), allow_private=True)
+        jellyfin_token = request.form.get("jellyfin_token", "").strip()
+        if jellyfin_token:
+            new_config["jellyfin_token"] = jellyfin_token
+        new_config["jellyfin_user"] = request.form.get("jellyfin_user", "").strip()
+        new_config["jellyfin_series"] = (
+            request.form.get("jellyfin_series", DEFAULT_CONFIG["jellyfin_series"]).strip()
+            or DEFAULT_CONFIG["jellyfin_series"]
+        )
+        config = new_config
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("setup"))
     _jf_user_cache["id"] = None
     _jf_series_cache["id"] = None
     _jf_seasons_cache["data"] = None
@@ -1497,7 +1809,7 @@ def save_setup():
     return redirect(url_for("setup"))
 
 
-@app.get("/sync-metadata")
+@app.post("/sync-metadata")
 def sync_metadata_route():
     config = cargar_config()
     if not str(config.get("metadata_dir", "")).strip():
@@ -1515,14 +1827,25 @@ def sync_metadata_route():
 
 @app.before_request
 def check_setup():
-    if request.endpoint in {"setup", "save_setup", "sync_metadata_route", "img_show_poster",
+    ensure_auth_is_configured()
+    if auth_required() and request.endpoint not in PUBLIC_ENDPOINTS and not is_authenticated():
+        if wants_json_response():
+            return jsonify({"ok": False, "error": "auth_required"}), 401
+        return redirect(url_for("login", next=request.path))
+    if request.method not in SAFE_METHODS and request.endpoint != "login_submit":
+        validate_csrf()
+    if request.endpoint in {"login", "login_submit", "setup", "save_setup", "sync_metadata_route", "img_show_poster",
                              "img_show_backdrop", "img_season_poster", "api_jobs", "api_jobs_clear",
-                             "favicon", "static"}:
+                             "api_jobs_cancel", "favicon", "static"}:
         return
     config = cargar_config()
     if not config_completa(config):
+        if wants_json_response():
+            return jsonify({"ok": False, "error": "setup_required"}), 428
         return redirect(url_for("setup"))
     if not metadatos_ok(config):
+        if wants_json_response():
+            return jsonify({"ok": False, "error": "metadata_sync_required"}), 428
         flash("Sincroniza los metadatos antes de continuar.")
         return redirect(url_for("setup"))
 
@@ -1557,12 +1880,13 @@ def home():
         cards.append(f"""
 <a class="season-card" href="/season/{n}" data-season="{n}">
   <div class="poster-wrap">
-    <img src="/img/season/{n}/poster" alt="" onerror="this.parentNode.innerHTML='<div class=no-poster>🏴‍☠️</div>'">
+    <div class="no-poster">OP</div>
+    <img src="/img/season/{n}/poster" alt="" onerror="this.style.display='none'">
     <span class="status-dot {dot}"></span>
   </div>
   <div class="card-body">
     <div class="card-num">Temporada {n}</div>
-    <div class="card-title">{title}</div>
+    <div class="card-title">{escape(title)}</div>
     <div class="prog-wrap">
       <div class="prog-bar"><div class="fill" style="width:{pct}%"></div></div>
       <span class="prog-text">{prog_text}</span>
@@ -1580,7 +1904,7 @@ def home():
   </div>
   <div style="display:flex;gap:10px;flex-wrap:wrap">
     <a class="btn btn-ghost btn-sm" href="/setup">Configuración</a>
-    <a class="btn btn-ghost btn-sm" href="/sync-metadata">Sincronizar metadatos</a>
+    <form method="post" action="/sync-metadata" style="display:inline">{csrf_input()}<button class="btn btn-ghost btn-sm" type="submit">Sincronizar metadatos</button></form>
   </div>
 </div>
 <div class="season-grid">{cards_html}</div>
@@ -1623,9 +1947,9 @@ def season_detail(n: int):
     dl_all_btn = ""
     del_all_btn = ""
     if has_link:
-        dl_all_btn = f'<form method="post" action="/download/season/{n}" style="display:inline"><button class="btn btn-primary" type="submit">⬇ Descargar todo</button></form>'
+        dl_all_btn = f'<form method="post" action="/download/season/{n}" style="display:inline">{csrf_input()}<button class="btn btn-primary" type="submit">⬇ Descargar todo</button></form>'
     if dl_count > 0:
-        del_all_btn = f'<form method="post" action="/delete/season/{n}" style="display:inline" onsubmit="return confirm(\'¿Eliminar los {dl_count} episodios descargados?\')"><button class="btn btn-danger" type="submit">🗑 Eliminar todo</button></form>'
+        del_all_btn = f'<form method="post" action="/delete/season/{n}" style="display:inline" onsubmit="return confirm(\'¿Eliminar los {dl_count} episodios descargados?\')">{csrf_input()}<button class="btn btn-danger" type="submit">🗑 Eliminar todo</button></form>'
 
     job_id_season = f"season-{n}"
     jobs = jobs_snapshot()
@@ -1639,12 +1963,12 @@ def season_detail(n: int):
   </div>
   <div class="s-info">
     <div class="s-num">Temporada {n}</div>
-    <div class="s-title">{title}</div>
+    <div class="s-title">{escape(title)}</div>
     <div class="s-stats">
       <div class="stat"><span class="stat-val">{total_ep}</span><span class="stat-lbl">Episodios totales</span></div>
       <div class="stat"><span class="stat-val" style="color:var(--success)">{dl_count}</span><span class="stat-lbl">Descargados</span></div>
-      <div class="stat"><span class="stat-val">{quality}</span><span class="stat-lbl">Calidad elegida</span></div>
-      <div class="stat"><span class="stat-val" style="font-size:.9rem">{qualities_available}</span><span class="stat-lbl">Disponible en</span></div>
+      <div class="stat"><span class="stat-val">{escape(quality)}</span><span class="stat-lbl">Calidad elegida</span></div>
+      <div class="stat"><span class="stat-val" style="font-size:.9rem">{escape(qualities_available)}</span><span class="stat-lbl">Disponible en</span></div>
     </div>
     <div class="season-actions">
       {"<span style='color:var(--accent);font-size:.875rem'>⏳ Descargando...</span>" if season_downloading else dl_all_btn}
@@ -1674,9 +1998,9 @@ def season_detail(n: int):
         watched_badge = ""
         if downloaded and jf_ep:
             if jf_ep["played"]:
-                watched_badge = f'<form method="post" action="/jellyfin/watched/{n}/{en}" style="display:inline"><button class="ep-badge watched" type="submit" title="Marcar como no visto">✓ Visto</button></form>'
+                watched_badge = f'<form method="post" action="/jellyfin/watched/{n}/{en}" style="display:inline">{csrf_input()}<button class="ep-badge watched" type="submit" title="Marcar como no visto">✓ Visto</button></form>'
             else:
-                watched_badge = f'<form method="post" action="/jellyfin/watched/{n}/{en}" style="display:inline"><button class="ep-badge unwatched" type="submit" title="Marcar como visto">○ No visto</button></form>'
+                watched_badge = f'<form method="post" action="/jellyfin/watched/{n}/{en}" style="display:inline">{csrf_input()}<button class="ep-badge unwatched" type="submit" title="Marcar como visto">○ No visto</button></form>'
 
         if ep_downloading:
             action = (
@@ -1690,10 +2014,10 @@ def season_detail(n: int):
             )
         elif downloaded:
             play_btn = f'<a class="btn btn-primary btn-sm" href="/jellyfin/play/{n}/{en}" title="Ver en Jellyfin">▶</a>' if jellyfin_url else ""
-            del_btn = f'<form method="post" action="/delete/season/{n}/episode/{en}" onsubmit="return confirm(\'¿Eliminar episodio {en}?\')"><button class="btn btn-danger btn-sm" type="submit">🗑</button></form>'
+            del_btn = f'<form method="post" action="/delete/season/{n}/episode/{en}" onsubmit="return confirm(\'¿Eliminar episodio {en}?\')">{csrf_input()}<button class="btn btn-danger btn-sm" type="submit">🗑</button></form>'
             action = f'<div style="display:flex;gap:6px;align-items:center">{play_btn}{del_btn}</div>'
         elif available:
-            action = f'<form method="post" action="/download/season/{n}/episode/{en}"><button class="btn btn-primary btn-sm" type="submit">⬇</button></form>'
+            action = f'<form method="post" action="/download/season/{n}/episode/{en}">{csrf_input()}<button class="btn btn-primary btn-sm" type="submit">⬇</button></form>'
         else:
             action = '<span class="no-av">No disponible</span>'
 
@@ -1706,9 +2030,9 @@ def season_detail(n: int):
   <div class="ep-card {"ep-downloaded" if downloaded else ""}">
     <div class="ep-num">E{en:02d}</div>
     <div class="ep-body">
-      <div class="ep-title">{et}</div>
-      {"<div class='ep-plot'>" + ep_plot + "</div>" if ep_plot else ""}
-      {"<div class='ep-meta'>" + meta_str + "</div>" if meta_str else ""}
+      <div class="ep-title">{escape(et)}</div>
+      {"<div class='ep-plot'>" + str(escape(ep_plot)) + "</div>" if ep_plot else ""}
+      {"<div class='ep-meta'>" + str(escape(meta_str)) + "</div>" if meta_str else ""}
     </div>
     <div class="ep-actions">{badge}{watched_badge}{action}</div>
   </div>"""
@@ -1719,47 +2043,56 @@ def season_detail(n: int):
 
 # ── Download / Delete actions ──────────────────────────────────────────────────
 
-@app.post("/download/season/<int:n>")
-def download_season(n: int):
+def _start_download_season(n: int, *, as_json: bool = False):
     config = cargar_config()
     arc = cargar_arc_por_numero(n, config)
     if not arc:
+        if as_json:
+            return jsonify({"ok": False, "error": "Temporada no encontrada."}), 404
         flash("Temporada no encontrada.")
         return redirect(url_for("home"))
     job_id = f"season-{n}"
     jobs = jobs_snapshot()
     if job_id in jobs and jobs[job_id]["status"] == "running":
+        if as_json:
+            return jsonify({"ok": True, "job_id": job_id, "already_running": True})
         flash("La temporada ya se está descargando.")
         return redirect(url_for("season_detail", n=n))
     job_create(job_id, f"T{n}: {arc.get('season_title', arc['id'])}")
     _run_in_thread(job_id, descargar_temporada_bg, arc, config)
+    if as_json:
+        return jsonify({"ok": True, "job_id": job_id})
     flash(f"Descarga de la temporada {n} iniciada en segundo plano.")
     return redirect(url_for("season_detail", n=n))
 
 
-@app.post("/download/season/<int:n>/episode/<int:e>")
-def download_episode(n: int, e: int):
+def _start_download_episode(n: int, e: int, *, as_json: bool = False):
     config = cargar_config()
     arc = cargar_arc_por_numero(n, config)
     if not arc:
+        if as_json:
+            return jsonify({"ok": False, "error": "Temporada no encontrada."}), 404
         flash("Temporada no encontrada.")
         return redirect(url_for("home"))
     job_id = f"ep-{n}-{e}"
     jobs = jobs_snapshot()
     if job_id in jobs and jobs[job_id]["status"] == "running":
+        if as_json:
+            return jsonify({"ok": True, "job_id": job_id, "already_running": True})
         flash("El episodio ya se está descargando.")
         return redirect(url_for("season_detail", n=n))
     title = arc.get("season_title", arc["id"])
     job_create(job_id, f"T{n} E{e:02d} — {title}")
     _run_in_thread(job_id, descargar_episodio_bg, arc, e, config)
+    if as_json:
+        return jsonify({"ok": True, "job_id": job_id})
     flash(f"Descarga del episodio {e} iniciada en segundo plano.")
     return redirect(url_for("season_detail", n=n))
 
 
-@app.post("/delete/season/<int:n>")
-def delete_season(n: int):
+def _delete_season(n: int, *, as_json: bool = False):
     config = cargar_config()
-    output_dir = Path(config["output_dir"]).expanduser()
+    output_dir = Path(validate_config_path(config["output_dir"], "Carpeta de episodios"))
     carpeta = output_dir / f"Season {n}"
     borrados = 0
     if carpeta.exists():
@@ -1771,25 +2104,54 @@ def delete_season(n: int):
                 if nfo.exists():
                     nfo.unlink()
     limpiar_temporales_si_ok(output_dir)
+    if as_json:
+        return jsonify({"ok": True, "deleted": borrados})
     flash(f"Eliminados {borrados} episodio(s) de la temporada {n}.")
     return redirect(url_for("season_detail", n=n))
 
 
-@app.post("/delete/season/<int:n>/episode/<int:e>")
-def delete_episode(n: int, e: int):
+def _delete_episode(n: int, e: int, *, as_json: bool = False):
     config = cargar_config()
-    output_dir = Path(config["output_dir"]).expanduser()
+    output_dir = Path(validate_config_path(config["output_dir"], "Carpeta de episodios"))
     f = encontrar_archivo_local(output_dir, n, e)
     if f:
         f.unlink()
         nfo = f.with_suffix(".nfo")
         if nfo.exists():
             nfo.unlink()
+        if as_json:
+            return jsonify({"ok": True, "deleted": 1})
         flash(f"Episodio {e} eliminado.")
     else:
+        if as_json:
+            return jsonify({"ok": True, "deleted": 0})
         flash(f"El episodio {e} no estaba descargado.")
     return redirect(url_for("season_detail", n=n))
 
 
+@app.post("/download/season/<int:n>")
+def download_season(n: int):
+    return _start_download_season(n)
+
+
+@app.post("/download/season/<int:n>/episode/<int:e>")
+def download_episode(n: int, e: int):
+    return _start_download_episode(n, e)
+
+
+@app.post("/delete/season/<int:n>")
+def delete_season(n: int):
+    return _delete_season(n)
+
+
+@app.post("/delete/season/<int:n>/episode/<int:e>")
+def delete_episode(n: int, e: int):
+    return _delete_episode(n, e)
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(
+        host=os.environ.get("OPDES_DEV_HOST", "127.0.0.1"),
+        port=int(os.environ.get("OPDES_DEV_PORT", "8080")),
+        debug=os.environ.get("OPDES_DEBUG", "").lower() in {"1", "true", "yes"},
+    )
