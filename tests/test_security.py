@@ -2,6 +2,7 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -208,3 +209,23 @@ def test_limpiar_temporales_no_borra_descargas_concurrentes(tmp_path):
 
     assert not terminado.exists()
     assert activo_file.exists(), "no debe borrar tmp de jobs concurrentes"
+
+
+def test_limpiar_temporales_no_escanea_arbol_completo(tmp_path, monkeypatch):
+    output_dir = tmp_path / "out"
+    (output_dir / "Season 1").mkdir(parents=True)
+    (output_dir / "Season 1" / "S01E01.mkv").write_bytes(b"video")
+
+    calls = []
+    real_rglob = Path.rglob
+
+    def spy(self, pattern):
+        calls.append((str(self), pattern))
+        return real_rglob(self, pattern)
+
+    monkeypatch.setattr(Path, "rglob", spy)
+
+    webapp.limpiar_temporales_si_ok(output_dir, slug="x")
+
+    assert not any(str(output_dir) in c[0] for c in calls), \
+        f"limpiar_temporales no debe recorrer output_dir entero: {calls}"
