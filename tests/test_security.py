@@ -229,3 +229,20 @@ def test_limpiar_temporales_no_escanea_arbol_completo(tmp_path, monkeypatch):
 
     assert not any(str(output_dir) in c[0] for c in calls), \
         f"limpiar_temporales no debe recorrer output_dir entero: {calls}"
+
+
+def test_job_cancel_force_libera_jobs_colgados(isolated_app):
+    webapp.job_create("zombie-1", "Zombie", lambda jid: None, ())
+    webapp._jobs["zombie-1"]["status"] = "running"
+    webapp._jobs["zombie-1"]["started_at"] = 0
+
+    with isolated_app.test_client() as client:
+        setup_response = client.get("/setup")
+        token = csrf_from(setup_response.get_data(as_text=True))
+        resp = client.post(
+            "/api/jobs/zombie-1/cancel?force=1",
+            headers={"X-CSRF-Token": token},
+        )
+
+    assert resp.status_code == 200
+    assert webapp._jobs["zombie-1"]["status"] == "cancelled"

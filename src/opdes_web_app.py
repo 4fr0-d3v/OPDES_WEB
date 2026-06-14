@@ -197,7 +197,7 @@ def enqueue_job(job_id: str) -> None:
             _job_queue_cv.notify()
 
 
-def job_cancel(job_id: str) -> bool:
+def job_cancel(job_id: str, force: bool = False) -> bool:
     with _job_queue_cv:
         job = _jobs.get(job_id)
         if not job:
@@ -213,6 +213,11 @@ def job_cancel(job_id: str) -> bool:
             ev = _cancel_flags.get(job_id)
             if ev:
                 ev.set()
+            if force:
+                job["status"] = "cancelled"
+                job["finished_at"] = time.time()
+                job["updated_at"] = job["finished_at"]
+                job["msg"] = "Cancelado a la fuerza (worker podría seguir activo)."
             return True
         return False
 
@@ -1756,9 +1761,10 @@ def api_jobs_cancel():
 
 @app.post("/api/jobs/<job_id>/cancel")
 def api_job_cancel(job_id: str):
-    if not job_cancel(job_id):
+    force = request.args.get("force", "").lower() in {"1", "true", "yes"}
+    if not job_cancel(job_id, force=force):
         return jsonify({"ok": False, "error": "Job no encontrado o no cancelable."}), 404
-    return jsonify({"ok": True, "job_id": job_id})
+    return jsonify({"ok": True, "job_id": job_id, "forced": force})
 
 
 @app.post("/api/jobs/<job_id>/retry")
