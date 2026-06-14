@@ -252,3 +252,14 @@ def test_setup_page_title_es_dinamico(isolated_app):
     with isolated_app.test_client() as client:
         html = client.get("/setup").get_data(as_text=True)
     assert "<title>Configuración" in html or "<title>Configuracion" in html
+
+
+def test_setup_indica_path_inaccesible(isolated_app):
+    webapp.guardar_config({
+        **webapp.DEFAULT_CONFIG,
+        "output_dir": "/no/existe/output",
+        "metadata_dir": "/no/existe/meta",
+    })
+    with isolated_app.test_client() as client:
+        html = client.get("/setup").get_data(as_text=True)
+    assert "no es accesible" in html.lower()

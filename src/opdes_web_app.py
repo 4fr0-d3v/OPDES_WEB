@@ -286,6 +286,21 @@ def metadatos_ok(config: dict) -> bool:
     return p.exists() and bool(list(p.glob("Season *")))
 
 
+def path_status(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    try:
+        p = Path(value).expanduser()
+        if not p.exists():
+            return "Path no es accesible desde el contenedor."
+        if not p.is_dir():
+            return "Path no es un directorio."
+    except OSError as exc:
+        return f"Path no es accesible desde el contenedor: {exc}"
+    return ""
+
+
 # ── Security helpers ───────────────────────────────────────────────────────────
 
 PUBLIC_ENDPOINTS = {"login", "login_submit", "favicon", "static"}
@@ -1881,6 +1896,17 @@ def setup():
     if errors_cfg and not step1_done:
         errors_html = '<div class="form-errors"><ul>' + "".join(f"<li>{e}</li>" for e in errors_cfg) + "</ul></div>"
 
+    output_status = path_status(config.get("output_dir", ""))
+    metadata_status = path_status(config.get("metadata_dir", ""))
+    output_warning = (
+        f'<div class="form-hint" style="color:var(--danger)">⚠ {escape(output_status)}</div>'
+        if output_status else ""
+    )
+    metadata_warning = (
+        f'<div class="form-hint" style="color:var(--danger)">⚠ {escape(metadata_status)}</div>'
+        if metadata_status else ""
+    )
+
     q = config.get("quality", "max")
     opts = "".join(
         f'<option value="{v}" {"selected" if q == v else ""}>{v}</option>'
@@ -1898,11 +1924,13 @@ def setup():
         <label for="setup-output-dir">Carpeta de episodios</label>
         <input id="setup-output-dir" name="output_dir" value="{escape(config.get('output_dir',''))}" placeholder="/media/Series/One Pace">
         <div class="form-hint">Aquí se guardarán los vídeos descargados.</div>
+        {output_warning}
       </div>
       <div class="form-group">
         <label for="setup-metadata-dir">Carpeta de metadatos</label>
         <input id="setup-metadata-dir" name="metadata_dir" value="{escape(config.get('metadata_dir',''))}" placeholder="/srv/opdes/metadatos">
         <div class="form-hint">NFOs, pósters y carátulas de temporadas y episodios.</div>
+        {metadata_warning}
       </div>
       <div class="form-group">
         <label for="setup-url">URL One Pace</label>
