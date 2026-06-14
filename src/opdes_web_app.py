@@ -802,15 +802,15 @@ def encontrar_archivo_local(output_dir: Path, season_number: int, episode_number
     return None
 
 
-def limpiar_temporales_si_ok(base_dir: Path) -> None:
+def limpiar_temporales_si_ok(base_dir: Path, slug: str | None = None) -> None:
+    if slug:
+        tmp_dir = base_dir / "_tmp" / slug
+        if tmp_dir.exists() and tmp_dir.is_dir():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
     tmp_dir = base_dir / "_tmp"
     if tmp_dir.exists() and tmp_dir.is_dir():
         shutil.rmtree(tmp_dir, ignore_errors=True)
-    for ds_store in base_dir.rglob(".DS_Store"):
-        try:
-            ds_store.unlink()
-        except Exception:
-            pass
 
 
 # ── Download ───────────────────────────────────────────────────────────────────
@@ -974,13 +974,13 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
                 rutas_finales.append(
                     renombrar_y_copiar_nfo_segun_metadata(ruta_path, output_dir, indice_metadatos, arc["season_number"])
                 )
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="done", msg=f"Descargados {len(rutas_finales)} episodio(s).")
     except InterruptedError:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="cancelled")
     except Exception as e:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="error", msg=str(e))
 
 
@@ -1032,13 +1032,13 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
     try:
         ruta = descargar_archivo_reanudable(file_id, pd_nombre, tmp_dir, session, url, progress_cb, cancel_ev)
         renombrar_y_copiar_nfo_segun_metadata(ruta, output_dir, indice_metadatos, arc["season_number"])
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="done", msg=f"Episodio {episode_number} descargado.")
     except InterruptedError:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="cancelled")
     except Exception as e:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="error", msg=str(e))
 
 

@@ -191,3 +191,20 @@ def test_bulk_episode_download_endpoint_starts_selected_jobs(isolated_app, monke
 
     assert response.status_code == 200
     assert response.get_json()["job_ids"] == ["ep-1-1"]
+
+
+def test_limpiar_temporales_no_borra_descargas_concurrentes(tmp_path):
+    output_dir = tmp_path / "out"
+    activo = output_dir / "_tmp" / "arc-en-curso"
+    activo.mkdir(parents=True)
+    activo_file = activo / "ep01.mkv.part"
+    activo_file.write_bytes(b"partial")
+
+    terminado = output_dir / "_tmp" / "arc-terminado"
+    terminado.mkdir(parents=True)
+    (terminado / "ep01.mkv.part").write_bytes(b"viejo")
+
+    webapp.limpiar_temporales_si_ok(output_dir, slug="arc-terminado")
+
+    assert not terminado.exists()
+    assert activo_file.exists(), "no debe borrar tmp de jobs concurrentes"
