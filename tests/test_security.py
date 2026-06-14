@@ -246,3 +246,9 @@ def test_job_cancel_force_libera_jobs_colgados(isolated_app):
 
     assert resp.status_code == 200
     assert webapp._jobs["zombie-1"]["status"] == "cancelled"
+
+
+def test_setup_page_title_es_dinamico(isolated_app):
+    with isolated_app.test_client() as client:
+        html = client.get("/setup").get_data(as_text=True)
+    assert "<title>Configuración" in html or "<title>Configuracion" in html

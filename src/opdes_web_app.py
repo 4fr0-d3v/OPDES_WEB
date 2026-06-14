@@ -1394,7 +1394,7 @@ LAYOUT = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{% block title %}ONE PACE DES{% endblock %}</title>
+  <title>{{ page_title }}</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <style>{{ css|safe }}</style>
 </head>
