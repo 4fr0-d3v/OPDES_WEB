@@ -62,12 +62,43 @@ def _load_secret_key() -> str:
     return secrets.token_hex(32)
 
 
+def env_list(name: str) -> list[str]:
+    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+
+
+def admin_auth_configured() -> bool:
+    return bool(
+        os.environ.get("OPDES_ADMIN_TOKEN", "").strip()
+        or (
+            os.environ.get("OPDES_ADMIN_USER", "").strip()
+            and os.environ.get("OPDES_ADMIN_PASSWORD_HASH", "").strip()
+        )
+    )
+
+
 app.secret_key = _load_secret_key()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("OPDES_SESSION_SECURE", "").lower() in {"1", "true", "yes"},
 )
+
+
+def warn_if_no_admin_auth() -> None:
+    if admin_auth_configured():
+        return
+    if os.environ.get("OPDES_ENV", "development").lower() == "production":
+        return
+    import sys
+    print(
+        "WARNING: OPDES corre sin autenticacion admin. "
+        "Define OPDES_ENV=production y OPDES_ADMIN_TOKEN o "
+        "OPDES_ADMIN_USER/OPDES_ADMIN_PASSWORD_HASH antes de exponerlo en red.",
+        file=sys.stderr, flush=True,
+    )
+
+
+warn_if_no_admin_auth()
 
 # ── Job tracking ───────────────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -305,20 +336,6 @@ def path_status(raw: str) -> str:
 
 PUBLIC_ENDPOINTS = {"login", "login_submit", "favicon", "static"}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-
-
-def env_list(name: str) -> list[str]:
-    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
-
-
-def admin_auth_configured() -> bool:
-    return bool(
-        os.environ.get("OPDES_ADMIN_TOKEN", "").strip()
-        or (
-            os.environ.get("OPDES_ADMIN_USER", "").strip()
-            and os.environ.get("OPDES_ADMIN_PASSWORD_HASH", "").strip()
-        )
-    )
 
 
 def auth_required() -> bool:

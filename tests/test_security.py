@@ -377,3 +377,22 @@ def test_extraer_calidad_detecta_2160p_y_4k():
     assert webapp.extraer_calidad_desde_texto("One Pace 2160p HEVC") == "2160p"
     assert webapp.extraer_calidad_desde_texto("Arco 4K") == "2160p"
     assert webapp.ordenar_calidades("2160p") > webapp.ordenar_calidades("1080p")
+
+
+def test_warning_si_no_auth_configurada_en_desarrollo(monkeypatch, capsys):
+    monkeypatch.delenv("OPDES_ENV", raising=False)
+    monkeypatch.delenv("OPDES_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("OPDES_ADMIN_USER", raising=False)
+    monkeypatch.delenv("OPDES_ADMIN_PASSWORD_HASH", raising=False)
+    webapp.warn_if_no_admin_auth()
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "sin autenticacion" in err.lower() or "sin autenticación" in err.lower()
+
+
+def test_no_warning_en_produccion_con_token(monkeypatch, capsys):
+    monkeypatch.setenv("OPDES_ENV", "production")
+    monkeypatch.setenv("OPDES_ADMIN_TOKEN", "tok")
+    webapp.warn_if_no_admin_auth()
+    err = capsys.readouterr().err
+    assert "WARNING" not in err
