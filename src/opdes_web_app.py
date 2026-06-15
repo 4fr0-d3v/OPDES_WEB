@@ -1681,13 +1681,24 @@ def _toggle_jellyfin_watched(season: int, episode: int, *, as_json: bool = False
     headers = {"X-Emby-Authorization": f'MediaBrowser Token="{token}"'}
     try:
         if played:
-            requests.delete(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
+            r = requests.delete(
+                f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}",
+                headers=headers,
+                timeout=5,
+            )
         else:
-            requests.post(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
-    except Exception:
+            r = requests.post(
+                f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}",
+                headers=headers,
+                timeout=5,
+            )
+        r.raise_for_status()
+    except Exception as exc:
+        msg = f"Error al actualizar el estado en Jellyfin: {exc}"
         if as_json:
-            return jsonify({"ok": False, "error": "Error al actualizar el estado en Jellyfin."}), 502
-        flash("Error al actualizar el estado en Jellyfin.")
+            return jsonify({"ok": False, "error": msg}), 502
+        flash(msg, "error")
+        return redirect(url_for("season_detail", n=season))
     if as_json:
         return jsonify({"ok": True, "played": not played})
     return redirect(url_for("season_detail", n=season))

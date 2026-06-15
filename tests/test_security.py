@@ -5,6 +5,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import requests
 
 import src.opdes_web_app as webapp
 
@@ -263,3 +264,30 @@ def test_setup_indica_path_inaccesible(isolated_app):
     with isolated_app.test_client() as client:
         html = client.get("/setup").get_data(as_text=True)
     assert "no es accesible" in html.lower()
+
+
+def test_toggle_watched_falla_si_jellyfin_devuelve_error(isolated_app, monkeypatch):
+    monkeypatch.setattr(webapp, "jellyfin_get_user_id", lambda cfg: "u1")
+    monkeypatch.setattr(
+        webapp,
+        "jellyfin_season_data",
+        lambda s, cfg: {1: {"id": "i1", "played": False}},
+    )
+
+    class FakeResp:
+        status_code = 500
+
+        def raise_for_status(self):
+            raise requests.HTTPError("boom")
+
+    monkeypatch.setattr(webapp.requests, "post", lambda *a, **k: FakeResp())
+
+    with isolated_app.test_client() as client:
+        token = csrf_from(client.get("/setup").get_data(as_text=True))
+        resp = client.post(
+            "/api/jellyfin/watched/1/1",
+            headers={"X-CSRF-Token": token},
+        )
+
+    assert resp.status_code == 502
+    assert resp.get_json()["ok"] is False
