@@ -325,3 +325,20 @@ def test_jellyfin_get_user_id_reintenta_en_fallo_transitorio(monkeypatch):
     })
     assert uid == "u1"
     assert calls["n"] == 2
+
+
+def test_api_cache_clear_resetea_caches(isolated_app):
+    webapp._catalog_cache = {"data": ["x"], "ts": 9999999999.0}
+    webapp._pixeldrain_episode_cache["http://x"] = {"episodes": [1], "ts": 9999999999.0}
+    webapp._jf_user_cache["id"] = "cache"
+    webapp._jf_user_cache["ts"] = 9999999999.0
+
+    with isolated_app.test_client() as client:
+        token = csrf_from(client.get("/setup").get_data(as_text=True))
+        resp = client.post("/api/cache/clear", headers={"X-CSRF-Token": token})
+
+    assert resp.status_code == 200
+    assert resp.get_json()["ok"] is True
+    assert webapp._catalog_cache["data"] is None
+    assert webapp._pixeldrain_episode_cache == {}
+    assert webapp._jf_user_cache["id"] is None

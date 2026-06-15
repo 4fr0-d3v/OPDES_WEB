@@ -1817,6 +1817,20 @@ def api_job_retry(job_id: str):
     return jsonify({"ok": True, "job_id": job_id})
 
 
+@app.post("/api/cache/clear")
+def api_cache_clear():
+    global _catalog_cache
+    _catalog_cache = {"data": None, "ts": 0.0}
+    _pixeldrain_episode_cache.clear()
+    _jf_user_cache["id"] = None
+    _jf_user_cache["ts"] = 0.0
+    _jf_series_cache["id"] = None
+    _jf_series_cache["ts"] = 0.0
+    _jf_seasons_cache["data"] = None
+    _jf_seasons_cache["ts"] = 0.0
+    return jsonify({"ok": True})
+
+
 @app.get("/api/catalog")
 def api_catalog():
     config = cargar_config()
@@ -2087,7 +2101,7 @@ def check_setup():
         validate_csrf()
     if request.endpoint in {"login", "login_submit", "setup", "save_setup", "sync_metadata_route", "img_show_poster",
                              "img_show_backdrop", "img_season_poster", "api_jobs", "api_jobs_clear",
-                             "api_jobs_cancel", "api_job_cancel", "api_job_retry", "favicon", "static"}:
+                             "api_jobs_cancel", "api_job_cancel", "api_job_retry", "api_cache_clear", "favicon", "static"}:
         return
     config = cargar_config()
     if not config_completa(config):
