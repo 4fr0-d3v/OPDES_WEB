@@ -1512,6 +1512,26 @@ def logout():
 
 # ── Jellyfin integration ───────────────────────────────────────────────────────
 
+def _jf_request_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    params: dict | None = None,
+    timeout: int = 5,
+    retries: int = 2,
+):
+    for attempt in range(retries + 1):
+        try:
+            r = requests.request(method, url, headers=headers, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except RequestException:
+            if attempt < retries:
+                time.sleep(0.3 * (attempt + 1))
+    return None
+
+
 _jf_user_cache: dict = {"id": None, "ts": 0.0}
 _jf_series_cache: dict = {"id": None, "ts": 0.0}
 _jf_seasons_cache: dict = {"data": None, "ts": 0.0}
@@ -1530,28 +1550,25 @@ def jellyfin_get_user_id(config: dict) -> str | None:
     username = str(config.get("jellyfin_user", "")).strip().lower()
     if not url or not token:
         return None
-    try:
-        resp = requests.get(f"{url}/Users", headers=_jf_headers(token), timeout=5)
-        resp.raise_for_status()
-        users = resp.json()
-        user_id = None
-        if username:
-            for u in users:
-                if u.get("Name", "").lower() == username:
-                    user_id = u["Id"]
-                    break
-        if not user_id:
-            for u in users:
-                if u.get("Policy", {}).get("IsAdministrator", False):
-                    user_id = u["Id"]
-                    break
-        if not user_id and users:
-            user_id = users[0]["Id"]
-        _jf_user_cache["id"] = user_id
-        _jf_user_cache["ts"] = now
-        return user_id
-    except Exception:
+    users = _jf_request_json("GET", f"{url}/Users", headers=_jf_headers(token))
+    if users is None:
         return None
+    user_id = None
+    if username:
+        for u in users:
+            if u.get("Name", "").lower() == username:
+                user_id = u["Id"]
+                break
+    if not user_id:
+        for u in users:
+            if u.get("Policy", {}).get("IsAdministrator", False):
+                user_id = u["Id"]
+                break
+    if not user_id and users:
+        user_id = users[0]["Id"]
+    _jf_user_cache["id"] = user_id
+    _jf_user_cache["ts"] = now
+    return user_id
 
 
 def jellyfin_get_series_id(config: dict) -> str | None:
@@ -1563,27 +1580,31 @@ def jellyfin_get_series_id(config: dict) -> str | None:
     series_name = str(config.get("jellyfin_series", "One Piece")).strip()
     if not url or not token:
         return None
-    try:
-        resp = requests.get(
-            f"{url}/Items",
-            params={"IncludeItemTypes": "Series", "Recursive": "true", "SearchTerm": series_name, "Fields": "Id,Name", "Limit": 10},
-            headers=_jf_headers(token),
-            timeout=5,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("Items", [])
-        series_id = None
-        for item in items:
-            if item.get("Name", "").lower() == series_name.lower():
-                series_id = item["Id"]
-                break
-        if not series_id and items:
-            series_id = items[0]["Id"]
-        _jf_series_cache["id"] = series_id
-        _jf_series_cache["ts"] = now
-        return series_id
-    except Exception:
+    payload = _jf_request_json(
+        "GET",
+        f"{url}/Items",
+        headers=_jf_headers(token),
+        params={
+            "IncludeItemTypes": "Series",
+            "Recursive": "true",
+            "SearchTerm": series_name,
+            "Fields": "Id,Name",
+            "Limit": 10,
+        },
+    )
+    if payload is None:
         return None
+    items = payload.get("Items", [])
+    series_id = None
+    for item in items:
+        if item.get("Name", "").lower() == series_name.lower():
+            series_id = item["Id"]
+            break
+    if not series_id and items:
+        series_id = items[0]["Id"]
+    _jf_series_cache["id"] = series_id
+    _jf_series_cache["ts"] = now
+    return series_id
 
 
 def jellyfin_get_season_id(season: int, config: dict) -> str | None:
@@ -1598,24 +1619,22 @@ def jellyfin_get_season_id(season: int, config: dict) -> str | None:
     series_id = jellyfin_get_series_id(config)
     if not user_id or not series_id:
         return None
-    try:
-        resp = requests.get(
-            f"{url}/Shows/{series_id}/Seasons",
-            params={"UserId": user_id, "Fields": "Id,IndexNumber"},
-            headers=_jf_headers(token),
-            timeout=5,
-        )
-        resp.raise_for_status()
-        mapping: dict[int, str] = {}
-        for item in resp.json().get("Items", []):
-            idx = item.get("IndexNumber")
-            if idx is not None:
-                mapping[idx] = item["Id"]
-        _jf_seasons_cache["data"] = mapping
-        _jf_seasons_cache["ts"] = now
-        return mapping.get(season)
-    except Exception:
+    payload = _jf_request_json(
+        "GET",
+        f"{url}/Shows/{series_id}/Seasons",
+        headers=_jf_headers(token),
+        params={"UserId": user_id, "Fields": "Id,IndexNumber"},
+    )
+    if payload is None:
         return None
+    mapping: dict[int, str] = {}
+    for item in payload.get("Items", []):
+        idx = item.get("IndexNumber")
+        if idx is not None:
+            mapping[idx] = item["Id"]
+    _jf_seasons_cache["data"] = mapping
+    _jf_seasons_cache["ts"] = now
+    return mapping.get(season)
 
 
 def jellyfin_season_data(season: int, config: dict) -> dict[int, dict]:
@@ -1627,30 +1646,28 @@ def jellyfin_season_data(season: int, config: dict) -> dict[int, dict]:
     season_id = jellyfin_get_season_id(season, config)
     if not user_id or not season_id:
         return {}
-    try:
-        resp = requests.get(
-            f"{url}/Items",
-            params={
-                "ParentId": season_id,
-                "UserId": user_id,
-                "Fields": "Id,IndexNumber,UserData",
-                "IncludeItemTypes": "Episode",
-            },
-            headers=_jf_headers(token),
-            timeout=5,
-        )
-        resp.raise_for_status()
-        result = {}
-        for item in resp.json().get("Items", []):
-            ep_num = item.get("IndexNumber")
-            if ep_num is not None:
-                result[ep_num] = {
-                    "id": item["Id"],
-                    "played": item.get("UserData", {}).get("Played", False),
-                }
-        return result
-    except Exception:
+    payload = _jf_request_json(
+        "GET",
+        f"{url}/Items",
+        headers=_jf_headers(token),
+        params={
+            "ParentId": season_id,
+            "UserId": user_id,
+            "Fields": "Id,IndexNumber,UserData",
+            "IncludeItemTypes": "Episode",
+        },
+    )
+    if payload is None:
         return {}
+    result = {}
+    for item in payload.get("Items", []):
+        ep_num = item.get("IndexNumber")
+        if ep_num is not None:
+            result[ep_num] = {
+                "id": item["Id"],
+                "played": item.get("UserData", {}).get("Played", False),
+            }
+    return result
 
 
 def jellyfin_find_episode(season: int, episode: int, config: dict) -> str | None:

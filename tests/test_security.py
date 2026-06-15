@@ -291,3 +291,37 @@ def test_toggle_watched_falla_si_jellyfin_devuelve_error(isolated_app, monkeypat
 
     assert resp.status_code == 502
     assert resp.get_json()["ok"] is False
+
+
+def test_jellyfin_get_user_id_reintenta_en_fallo_transitorio(monkeypatch):
+    calls = {"n": 0}
+
+    class GoodResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{
+                "Id": "u1",
+                "Name": "kilian",
+                "Policy": {"IsAdministrator": True},
+            }]
+
+    def flaky(method, url, **kw):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise requests.ConnectionError("blip")
+        return GoodResp()
+
+    monkeypatch.setattr(webapp.requests, "request", flaky)
+    webapp._jf_user_cache["id"] = None
+    webapp._jf_user_cache["ts"] = 0.0
+    uid = webapp.jellyfin_get_user_id({
+        "jellyfin_url": "http://x",
+        "jellyfin_token": "t",
+        "jellyfin_user": "kilian",
+    })
+    assert uid == "u1"
+    assert calls["n"] == 2
