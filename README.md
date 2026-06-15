@@ -69,3 +69,46 @@ PYTHONPATH=. pytest -q
 ```
 
 La suite cubre CSRF, login/configuración sensible, extracción ZIP segura, parsing básico de Pixeldrain, disponibilidad de episodios y endpoints de cola.
+
+## Troubleshooting
+
+### Todo redirige a /setup o /api responde 428
+
+Síntoma: cualquier endpoint funcional devuelve `metadata_sync_required` o
+redirige al wizard.
+
+Causa habitual: el contenedor no puede leer `metadata_dir`. Revisa
+`POST /sync-metadata` desde la UI — el flash mostrará el `errno` exacto
+(p.ej. `Permission denied: '/mnt/nfs/data'`). Confirma que el bind mount
+NFS llega al contenedor y que el path en `~/.opdes/config.json` coincide
+con la ruta dentro del contenedor (no la del host). `/setup` ahora marca
+en rojo los paths que no son accesibles, así que confirma allí primero.
+
+### Un job se queda "running" para siempre
+
+Si un worker queda colgado (timeout NFS, Pixeldrain caído):
+
+```bash
+curl -X POST -H "X-CSRF-Token: $T" \
+  "http://HOST/api/jobs/<job-id>/cancel?force=1"
+```
+
+El estado pasa a `cancelled` y permite re-encolar. El thread original
+puede seguir vivo hasta que termine su request en curso.
+
+### Refrescar catálogo/Jellyfin antes del TTL
+
+```bash
+curl -X POST -H "X-CSRF-Token: $T" "http://HOST/api/cache/clear"
+```
+
+Vacía `_catalog_cache`, `_pixeldrain_episode_cache` y los tres caches
+Jellyfin.
+
+### La app expone /setup sin pedir login
+
+Significa que `OPDES_ENV` no es `production` y no hay admin configurado.
+Revisa `docker logs <container>` — al arranque debería verse el
+`WARNING: OPDES corre sin autenticacion admin.` Si lo ves, configura
+`OPDES_ENV=production` y `OPDES_ADMIN_TOKEN` (o `OPDES_ADMIN_USER` +
+`OPDES_ADMIN_PASSWORD_HASH`) y reinicia.
