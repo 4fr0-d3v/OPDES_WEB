@@ -2095,6 +2095,9 @@ def save_setup():
     except ValueError as e:
         flash(str(e), "error")
         return redirect(url_for("setup"))
+    global _catalog_cache
+    _catalog_cache = {"data": None, "ts": 0.0}
+    _pixeldrain_episode_cache.clear()
     _jf_user_cache["id"] = None
     _jf_series_cache["id"] = None
     _jf_seasons_cache["data"] = None

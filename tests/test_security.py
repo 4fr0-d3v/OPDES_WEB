@@ -35,6 +35,22 @@ def isolated_app(tmp_path, monkeypatch):
     return webapp.app
 
 
+@pytest.fixture(autouse=True)
+def _reset_module_state():
+    yield
+    webapp._jobs.clear()
+    webapp._cancel_flags.clear()
+    webapp._job_queue.clear()
+    webapp._catalog_cache = {"data": None, "ts": 0.0}
+    webapp._pixeldrain_episode_cache.clear()
+    webapp._jf_user_cache["id"] = None
+    webapp._jf_user_cache["ts"] = 0.0
+    webapp._jf_series_cache["id"] = None
+    webapp._jf_series_cache["ts"] = 0.0
+    webapp._jf_seasons_cache["data"] = None
+    webapp._jf_seasons_cache["ts"] = 0.0
+
+
 def csrf_from(html: str) -> str:
     match = re.search(r'name="csrf_token" value="([^"]+)"', html)
     assert match
@@ -396,3 +412,29 @@ def test_no_warning_en_produccion_con_token(monkeypatch, capsys):
     webapp.warn_if_no_admin_auth()
     err = capsys.readouterr().err
     assert "WARNING" not in err
+
+
+def test_save_setup_invalida_catalog_y_pixeldrain_cache(isolated_app):
+    webapp._catalog_cache = {"data": ["x"], "ts": 9999999999.0}
+    webapp._pixeldrain_episode_cache["http://x"] = {"episodes": [1], "ts": 9999999999.0}
+
+    with isolated_app.test_client() as client:
+        token = csrf_from(client.get("/setup").get_data(as_text=True))
+        resp = client.post(
+            "/setup",
+            data={
+                "csrf_token": token,
+                "url": webapp.DEFAULT_CONFIG["url"],
+                "output_dir": str(webapp.CONFIG_PATH.parent),
+                "metadata_dir": str(webapp.CONFIG_PATH.parent),
+                "quality": "max",
+                "jellyfin_url": "",
+                "jellyfin_token": "",
+                "jellyfin_user": "",
+                "jellyfin_series": "One Piece",
+            },
+        )
+
+    assert resp.status_code == 302
+    assert webapp._catalog_cache["data"] is None
+    assert webapp._pixeldrain_episode_cache == {}
