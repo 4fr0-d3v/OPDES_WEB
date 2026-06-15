@@ -486,12 +486,16 @@ def extraer_temporadas_y_pixeldrain(html: str) -> list[dict]:
 
 
 def extraer_calidad_desde_texto(texto: str) -> str | None:
-    m = re.search(r"(480p|720p|1080p)", texto, re.IGNORECASE)
-    return m.group(1).lower() if m else None
+    m = re.search(r"(2160p|1080p|720p|480p)", texto, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    if re.search(r"\b4k\b", texto, re.IGNORECASE):
+        return "2160p"
+    return None
 
 
 def ordenar_calidades(calidad: str) -> int:
-    return {"480p": 480, "720p": 720, "1080p": 1080}.get(calidad.lower(), 0)
+    return {"480p": 480, "720p": 720, "1080p": 1080, "2160p": 2160}.get(calidad.lower(), 0)
 
 
 def agrupar_por_temporada(items: list[dict]) -> list[dict]:
@@ -511,7 +515,7 @@ def agrupar_por_temporada(items: list[dict]) -> list[dict]:
 def elegir_opcion_por_calidad(opciones: list[dict], quality_config: str) -> dict | None:
     if not opciones:
         return None
-    validas = [x for x in opciones if x.get("quality") in {"480p", "720p", "1080p"}]
+    validas = [x for x in opciones if x.get("quality") in {"480p", "720p", "1080p", "2160p"}]
     if not validas:
         return opciones[0]
     ordenadas = sorted(validas, key=lambda x: ordenar_calidades(x["quality"]))
@@ -1960,7 +1964,7 @@ def setup():
     q = config.get("quality", "max")
     opts = "".join(
         f'<option value="{v}" {"selected" if q == v else ""}>{v}</option>'
-        for v in ["max", "1080p", "720p", "480p"]
+        for v in ["max", "2160p", "1080p", "720p", "480p"]
     )
     token_status = "Token configurado. Déjalo vacío para conservarlo." if config.get("jellyfin_token") else "Pega un token nuevo para activar Jellyfin."
 
@@ -2058,7 +2062,7 @@ def save_setup():
         new_config["output_dir"] = validate_config_path(request.form.get("output_dir", ""), "Carpeta de episodios")
         new_config["metadata_dir"] = validate_config_path(request.form.get("metadata_dir", ""), "Carpeta de metadatos")
         quality = request.form.get("quality", "max").strip().lower() or "max"
-        if quality not in {"max", "1080p", "720p", "480p"}:
+        if quality not in {"max", "2160p", "1080p", "720p", "480p"}:
             raise ValueError("Calidad no válida.")
         new_config["quality"] = quality
         new_config["jellyfin_url"] = validate_remote_url(request.form.get("jellyfin_url", ""), allow_private=True)

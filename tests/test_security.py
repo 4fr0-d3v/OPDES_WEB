@@ -371,3 +371,9 @@ def test_descargar_episodio_bg_single_file_rechaza_episodio_distinto(tmp_path, m
     )
     assert webapp._jobs["ep-1-3"]["status"] == "error"
     assert "no coincide" in webapp._jobs["ep-1-3"]["msg"].lower()
+
+
+def test_extraer_calidad_detecta_2160p_y_4k():
+    assert webapp.extraer_calidad_desde_texto("One Pace 2160p HEVC") == "2160p"
+    assert webapp.extraer_calidad_desde_texto("Arco 4K") == "2160p"
+    assert webapp.ordenar_calidades("2160p") > webapp.ordenar_calidades("1080p")
