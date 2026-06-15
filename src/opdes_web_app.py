@@ -1020,6 +1020,14 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
             info = pedir_json_resistente(f"/file/{item_id}/info", url)
             file_id = item_id
             pd_nombre = info.get("name") or f"{item_id}.bin"
+            parsed = parsear_nombre_descargado(pd_nombre)
+            if parsed and parsed["episode_in_arc"] != episode_number:
+                job_update(
+                    job_id,
+                    status="error",
+                    msg=f"El enlace single-file no coincide con el episodio {episode_number}.",
+                )
+                return
         else:
             archivos = pixeldrain_video_files(url)
             archivo_target = None

@@ -342,3 +342,32 @@ def test_api_cache_clear_resetea_caches(isolated_app):
     assert webapp._catalog_cache["data"] is None
     assert webapp._pixeldrain_episode_cache == {}
     assert webapp._jf_user_cache["id"] is None
+
+
+def test_descargar_episodio_bg_single_file_rechaza_episodio_distinto(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "extraer_tipo_e_id", lambda u: ("file", "abc"))
+    monkeypatch.setattr(
+        webapp,
+        "pedir_json_resistente",
+        lambda path, url: {"name": "[One Pace][1080p] Arc 05 [crc][quality][12345678].mkv"},
+    )
+    monkeypatch.setattr(webapp, "archivo_ya_existe_en_destino_final", lambda *a, **k: None)
+    monkeypatch.setattr(webapp, "construir_indice_metadatos", lambda md: {})
+
+    webapp.job_create("ep-1-3", "ep", lambda jid: None, ())
+    webapp.descargar_episodio_bg(
+        "ep-1-3",
+        {
+            "id": "arc",
+            "season_number": 1,
+            "opciones": [{"url": "https://pixeldrain.net/u/abc", "quality": "1080p"}],
+        },
+        3,
+        {
+            "output_dir": str(tmp_path / "out"),
+            "metadata_dir": str(tmp_path / "meta"),
+            "quality": "max",
+        },
+    )
+    assert webapp._jobs["ep-1-3"]["status"] == "error"
+    assert "no coincide" in webapp._jobs["ep-1-3"]["msg"].lower()
