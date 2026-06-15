@@ -62,12 +62,43 @@ def _load_secret_key() -> str:
     return secrets.token_hex(32)
 
 
+def env_list(name: str) -> list[str]:
+    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+
+
+def admin_auth_configured() -> bool:
+    return bool(
+        os.environ.get("OPDES_ADMIN_TOKEN", "").strip()
+        or (
+            os.environ.get("OPDES_ADMIN_USER", "").strip()
+            and os.environ.get("OPDES_ADMIN_PASSWORD_HASH", "").strip()
+        )
+    )
+
+
 app.secret_key = _load_secret_key()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("OPDES_SESSION_SECURE", "").lower() in {"1", "true", "yes"},
 )
+
+
+def warn_if_no_admin_auth() -> None:
+    if admin_auth_configured():
+        return
+    if os.environ.get("OPDES_ENV", "development").lower() == "production":
+        return
+    import sys
+    print(
+        "WARNING: OPDES corre sin autenticacion admin. "
+        "Define OPDES_ENV=production y OPDES_ADMIN_TOKEN o "
+        "OPDES_ADMIN_USER/OPDES_ADMIN_PASSWORD_HASH antes de exponerlo en red.",
+        file=sys.stderr, flush=True,
+    )
+
+
+warn_if_no_admin_auth()
 
 # ── Job tracking ───────────────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -197,7 +228,7 @@ def enqueue_job(job_id: str) -> None:
             _job_queue_cv.notify()
 
 
-def job_cancel(job_id: str) -> bool:
+def job_cancel(job_id: str, force: bool = False) -> bool:
     with _job_queue_cv:
         job = _jobs.get(job_id)
         if not job:
@@ -213,6 +244,11 @@ def job_cancel(job_id: str) -> bool:
             ev = _cancel_flags.get(job_id)
             if ev:
                 ev.set()
+            if force:
+                job["status"] = "cancelled"
+                job["finished_at"] = time.time()
+                job["updated_at"] = job["finished_at"]
+                job["msg"] = "Cancelado a la fuerza (worker podría seguir activo)."
             return True
         return False
 
@@ -281,24 +317,25 @@ def metadatos_ok(config: dict) -> bool:
     return p.exists() and bool(list(p.glob("Season *")))
 
 
+def path_status(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    try:
+        p = Path(value).expanduser()
+        if not p.exists():
+            return "Path no es accesible desde el contenedor."
+        if not p.is_dir():
+            return "Path no es un directorio."
+    except OSError as exc:
+        return f"Path no es accesible desde el contenedor: {exc}"
+    return ""
+
+
 # ── Security helpers ───────────────────────────────────────────────────────────
 
 PUBLIC_ENDPOINTS = {"login", "login_submit", "favicon", "static"}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-
-
-def env_list(name: str) -> list[str]:
-    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
-
-
-def admin_auth_configured() -> bool:
-    return bool(
-        os.environ.get("OPDES_ADMIN_TOKEN", "").strip()
-        or (
-            os.environ.get("OPDES_ADMIN_USER", "").strip()
-            and os.environ.get("OPDES_ADMIN_PASSWORD_HASH", "").strip()
-        )
-    )
 
 
 def auth_required() -> bool:
@@ -466,12 +503,16 @@ def extraer_temporadas_y_pixeldrain(html: str) -> list[dict]:
 
 
 def extraer_calidad_desde_texto(texto: str) -> str | None:
-    m = re.search(r"(480p|720p|1080p)", texto, re.IGNORECASE)
-    return m.group(1).lower() if m else None
+    m = re.search(r"(2160p|1080p|720p|480p)", texto, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    if re.search(r"\b4k\b", texto, re.IGNORECASE):
+        return "2160p"
+    return None
 
 
 def ordenar_calidades(calidad: str) -> int:
-    return {"480p": 480, "720p": 720, "1080p": 1080}.get(calidad.lower(), 0)
+    return {"480p": 480, "720p": 720, "1080p": 1080, "2160p": 2160}.get(calidad.lower(), 0)
 
 
 def agrupar_por_temporada(items: list[dict]) -> list[dict]:
@@ -491,7 +532,7 @@ def agrupar_por_temporada(items: list[dict]) -> list[dict]:
 def elegir_opcion_por_calidad(opciones: list[dict], quality_config: str) -> dict | None:
     if not opciones:
         return None
-    validas = [x for x in opciones if x.get("quality") in {"480p", "720p", "1080p"}]
+    validas = [x for x in opciones if x.get("quality") in {"480p", "720p", "1080p", "2160p"}]
     if not validas:
         return opciones[0]
     ordenadas = sorted(validas, key=lambda x: ordenar_calidades(x["quality"]))
@@ -802,15 +843,15 @@ def encontrar_archivo_local(output_dir: Path, season_number: int, episode_number
     return None
 
 
-def limpiar_temporales_si_ok(base_dir: Path) -> None:
+def limpiar_temporales_si_ok(base_dir: Path, slug: str | None = None) -> None:
+    if slug:
+        tmp_dir = base_dir / "_tmp" / slug
+        if tmp_dir.exists() and tmp_dir.is_dir():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
     tmp_dir = base_dir / "_tmp"
     if tmp_dir.exists() and tmp_dir.is_dir():
         shutil.rmtree(tmp_dir, ignore_errors=True)
-    for ds_store in base_dir.rglob(".DS_Store"):
-        try:
-            ds_store.unlink()
-        except Exception:
-            pass
 
 
 # ── Download ───────────────────────────────────────────────────────────────────
@@ -974,13 +1015,13 @@ def descargar_temporada_bg(job_id: str, arc: dict, config: dict) -> None:
                 rutas_finales.append(
                     renombrar_y_copiar_nfo_segun_metadata(ruta_path, output_dir, indice_metadatos, arc["season_number"])
                 )
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="done", msg=f"Descargados {len(rutas_finales)} episodio(s).")
     except InterruptedError:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="cancelled")
     except Exception as e:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="error", msg=str(e))
 
 
@@ -1000,6 +1041,14 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
             info = pedir_json_resistente(f"/file/{item_id}/info", url)
             file_id = item_id
             pd_nombre = info.get("name") or f"{item_id}.bin"
+            parsed = parsear_nombre_descargado(pd_nombre)
+            if parsed and parsed["episode_in_arc"] != episode_number:
+                job_update(
+                    job_id,
+                    status="error",
+                    msg=f"El enlace single-file no coincide con el episodio {episode_number}.",
+                )
+                return
         else:
             archivos = pixeldrain_video_files(url)
             archivo_target = None
@@ -1032,13 +1081,13 @@ def descargar_episodio_bg(job_id: str, arc: dict, episode_number: int, config: d
     try:
         ruta = descargar_archivo_reanudable(file_id, pd_nombre, tmp_dir, session, url, progress_cb, cancel_ev)
         renombrar_y_copiar_nfo_segun_metadata(ruta, output_dir, indice_metadatos, arc["season_number"])
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="done", msg=f"Episodio {episode_number} descargado.")
     except InterruptedError:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="cancelled")
     except Exception as e:
-        limpiar_temporales_si_ok(output_dir)
+        limpiar_temporales_si_ok(output_dir, slug=slugify(arc["id"]))
         job_update(job_id, status="error", msg=str(e))
 
 
@@ -1389,7 +1438,7 @@ LAYOUT = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{% block title %}ONE PACE DES{% endblock %}</title>
+  <title>{{ page_title }}</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <style>{{ css|safe }}</style>
 </head>
@@ -1492,6 +1541,26 @@ def logout():
 
 # ── Jellyfin integration ───────────────────────────────────────────────────────
 
+def _jf_request_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    params: dict | None = None,
+    timeout: int = 5,
+    retries: int = 2,
+):
+    for attempt in range(retries + 1):
+        try:
+            r = requests.request(method, url, headers=headers, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except RequestException:
+            if attempt < retries:
+                time.sleep(0.3 * (attempt + 1))
+    return None
+
+
 _jf_user_cache: dict = {"id": None, "ts": 0.0}
 _jf_series_cache: dict = {"id": None, "ts": 0.0}
 _jf_seasons_cache: dict = {"data": None, "ts": 0.0}
@@ -1510,28 +1579,25 @@ def jellyfin_get_user_id(config: dict) -> str | None:
     username = str(config.get("jellyfin_user", "")).strip().lower()
     if not url or not token:
         return None
-    try:
-        resp = requests.get(f"{url}/Users", headers=_jf_headers(token), timeout=5)
-        resp.raise_for_status()
-        users = resp.json()
-        user_id = None
-        if username:
-            for u in users:
-                if u.get("Name", "").lower() == username:
-                    user_id = u["Id"]
-                    break
-        if not user_id:
-            for u in users:
-                if u.get("Policy", {}).get("IsAdministrator", False):
-                    user_id = u["Id"]
-                    break
-        if not user_id and users:
-            user_id = users[0]["Id"]
-        _jf_user_cache["id"] = user_id
-        _jf_user_cache["ts"] = now
-        return user_id
-    except Exception:
+    users = _jf_request_json("GET", f"{url}/Users", headers=_jf_headers(token))
+    if users is None:
         return None
+    user_id = None
+    if username:
+        for u in users:
+            if u.get("Name", "").lower() == username:
+                user_id = u["Id"]
+                break
+    if not user_id:
+        for u in users:
+            if u.get("Policy", {}).get("IsAdministrator", False):
+                user_id = u["Id"]
+                break
+    if not user_id and users:
+        user_id = users[0]["Id"]
+    _jf_user_cache["id"] = user_id
+    _jf_user_cache["ts"] = now
+    return user_id
 
 
 def jellyfin_get_series_id(config: dict) -> str | None:
@@ -1543,27 +1609,31 @@ def jellyfin_get_series_id(config: dict) -> str | None:
     series_name = str(config.get("jellyfin_series", "One Piece")).strip()
     if not url or not token:
         return None
-    try:
-        resp = requests.get(
-            f"{url}/Items",
-            params={"IncludeItemTypes": "Series", "Recursive": "true", "SearchTerm": series_name, "Fields": "Id,Name", "Limit": 10},
-            headers=_jf_headers(token),
-            timeout=5,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("Items", [])
-        series_id = None
-        for item in items:
-            if item.get("Name", "").lower() == series_name.lower():
-                series_id = item["Id"]
-                break
-        if not series_id and items:
-            series_id = items[0]["Id"]
-        _jf_series_cache["id"] = series_id
-        _jf_series_cache["ts"] = now
-        return series_id
-    except Exception:
+    payload = _jf_request_json(
+        "GET",
+        f"{url}/Items",
+        headers=_jf_headers(token),
+        params={
+            "IncludeItemTypes": "Series",
+            "Recursive": "true",
+            "SearchTerm": series_name,
+            "Fields": "Id,Name",
+            "Limit": 10,
+        },
+    )
+    if payload is None:
         return None
+    items = payload.get("Items", [])
+    series_id = None
+    for item in items:
+        if item.get("Name", "").lower() == series_name.lower():
+            series_id = item["Id"]
+            break
+    if not series_id and items:
+        series_id = items[0]["Id"]
+    _jf_series_cache["id"] = series_id
+    _jf_series_cache["ts"] = now
+    return series_id
 
 
 def jellyfin_get_season_id(season: int, config: dict) -> str | None:
@@ -1578,24 +1648,22 @@ def jellyfin_get_season_id(season: int, config: dict) -> str | None:
     series_id = jellyfin_get_series_id(config)
     if not user_id or not series_id:
         return None
-    try:
-        resp = requests.get(
-            f"{url}/Shows/{series_id}/Seasons",
-            params={"UserId": user_id, "Fields": "Id,IndexNumber"},
-            headers=_jf_headers(token),
-            timeout=5,
-        )
-        resp.raise_for_status()
-        mapping: dict[int, str] = {}
-        for item in resp.json().get("Items", []):
-            idx = item.get("IndexNumber")
-            if idx is not None:
-                mapping[idx] = item["Id"]
-        _jf_seasons_cache["data"] = mapping
-        _jf_seasons_cache["ts"] = now
-        return mapping.get(season)
-    except Exception:
+    payload = _jf_request_json(
+        "GET",
+        f"{url}/Shows/{series_id}/Seasons",
+        headers=_jf_headers(token),
+        params={"UserId": user_id, "Fields": "Id,IndexNumber"},
+    )
+    if payload is None:
         return None
+    mapping: dict[int, str] = {}
+    for item in payload.get("Items", []):
+        idx = item.get("IndexNumber")
+        if idx is not None:
+            mapping[idx] = item["Id"]
+    _jf_seasons_cache["data"] = mapping
+    _jf_seasons_cache["ts"] = now
+    return mapping.get(season)
 
 
 def jellyfin_season_data(season: int, config: dict) -> dict[int, dict]:
@@ -1607,30 +1675,28 @@ def jellyfin_season_data(season: int, config: dict) -> dict[int, dict]:
     season_id = jellyfin_get_season_id(season, config)
     if not user_id or not season_id:
         return {}
-    try:
-        resp = requests.get(
-            f"{url}/Items",
-            params={
-                "ParentId": season_id,
-                "UserId": user_id,
-                "Fields": "Id,IndexNumber,UserData",
-                "IncludeItemTypes": "Episode",
-            },
-            headers=_jf_headers(token),
-            timeout=5,
-        )
-        resp.raise_for_status()
-        result = {}
-        for item in resp.json().get("Items", []):
-            ep_num = item.get("IndexNumber")
-            if ep_num is not None:
-                result[ep_num] = {
-                    "id": item["Id"],
-                    "played": item.get("UserData", {}).get("Played", False),
-                }
-        return result
-    except Exception:
+    payload = _jf_request_json(
+        "GET",
+        f"{url}/Items",
+        headers=_jf_headers(token),
+        params={
+            "ParentId": season_id,
+            "UserId": user_id,
+            "Fields": "Id,IndexNumber,UserData",
+            "IncludeItemTypes": "Episode",
+        },
+    )
+    if payload is None:
         return {}
+    result = {}
+    for item in payload.get("Items", []):
+        ep_num = item.get("IndexNumber")
+        if ep_num is not None:
+            result[ep_num] = {
+                "id": item["Id"],
+                "played": item.get("UserData", {}).get("Played", False),
+            }
+    return result
 
 
 def jellyfin_find_episode(season: int, episode: int, config: dict) -> str | None:
@@ -1661,13 +1727,24 @@ def _toggle_jellyfin_watched(season: int, episode: int, *, as_json: bool = False
     headers = {"X-Emby-Authorization": f'MediaBrowser Token="{token}"'}
     try:
         if played:
-            requests.delete(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
+            r = requests.delete(
+                f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}",
+                headers=headers,
+                timeout=5,
+            )
         else:
-            requests.post(f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}", headers=headers, timeout=5)
-    except Exception:
+            r = requests.post(
+                f"{jellyfin_url}/Users/{user_id}/PlayedItems/{item_id}",
+                headers=headers,
+                timeout=5,
+            )
+        r.raise_for_status()
+    except Exception as exc:
+        msg = f"Error al actualizar el estado en Jellyfin: {exc}"
         if as_json:
-            return jsonify({"ok": False, "error": "Error al actualizar el estado en Jellyfin."}), 502
-        flash("Error al actualizar el estado en Jellyfin.")
+            return jsonify({"ok": False, "error": msg}), 502
+        flash(msg, "error")
+        return redirect(url_for("season_detail", n=season))
     if as_json:
         return jsonify({"ok": True, "played": not played})
     return redirect(url_for("season_detail", n=season))
@@ -1756,9 +1833,10 @@ def api_jobs_cancel():
 
 @app.post("/api/jobs/<job_id>/cancel")
 def api_job_cancel(job_id: str):
-    if not job_cancel(job_id):
+    force = request.args.get("force", "").lower() in {"1", "true", "yes"}
+    if not job_cancel(job_id, force=force):
         return jsonify({"ok": False, "error": "Job no encontrado o no cancelable."}), 404
-    return jsonify({"ok": True, "job_id": job_id})
+    return jsonify({"ok": True, "job_id": job_id, "forced": force})
 
 
 @app.post("/api/jobs/<job_id>/retry")
@@ -1766,6 +1844,20 @@ def api_job_retry(job_id: str):
     if not job_retry(job_id):
         return jsonify({"ok": False, "error": "Job no encontrado o no reintentable."}), 404
     return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.post("/api/cache/clear")
+def api_cache_clear():
+    global _catalog_cache
+    _catalog_cache = {"data": None, "ts": 0.0}
+    _pixeldrain_episode_cache.clear()
+    _jf_user_cache["id"] = None
+    _jf_user_cache["ts"] = 0.0
+    _jf_series_cache["id"] = None
+    _jf_series_cache["ts"] = 0.0
+    _jf_seasons_cache["data"] = None
+    _jf_seasons_cache["ts"] = 0.0
+    return jsonify({"ok": True})
 
 
 @app.get("/api/catalog")
@@ -1875,10 +1967,21 @@ def setup():
     if errors_cfg and not step1_done:
         errors_html = '<div class="form-errors"><ul>' + "".join(f"<li>{e}</li>" for e in errors_cfg) + "</ul></div>"
 
+    output_status = path_status(config.get("output_dir", ""))
+    metadata_status = path_status(config.get("metadata_dir", ""))
+    output_warning = (
+        f'<div class="form-hint" style="color:var(--danger)">⚠ {escape(output_status)}</div>'
+        if output_status else ""
+    )
+    metadata_warning = (
+        f'<div class="form-hint" style="color:var(--danger)">⚠ {escape(metadata_status)}</div>'
+        if metadata_status else ""
+    )
+
     q = config.get("quality", "max")
     opts = "".join(
         f'<option value="{v}" {"selected" if q == v else ""}>{v}</option>'
-        for v in ["max", "1080p", "720p", "480p"]
+        for v in ["max", "2160p", "1080p", "720p", "480p"]
     )
     token_status = "Token configurado. Déjalo vacío para conservarlo." if config.get("jellyfin_token") else "Pega un token nuevo para activar Jellyfin."
 
@@ -1892,11 +1995,13 @@ def setup():
         <label for="setup-output-dir">Carpeta de episodios</label>
         <input id="setup-output-dir" name="output_dir" value="{escape(config.get('output_dir',''))}" placeholder="/media/Series/One Pace">
         <div class="form-hint">Aquí se guardarán los vídeos descargados.</div>
+        {output_warning}
       </div>
       <div class="form-group">
         <label for="setup-metadata-dir">Carpeta de metadatos</label>
         <input id="setup-metadata-dir" name="metadata_dir" value="{escape(config.get('metadata_dir',''))}" placeholder="/srv/opdes/metadatos">
         <div class="form-hint">NFOs, pósters y carátulas de temporadas y episodios.</div>
+        {metadata_warning}
       </div>
       <div class="form-group">
         <label for="setup-url">URL One Pace</label>
@@ -1974,7 +2079,7 @@ def save_setup():
         new_config["output_dir"] = validate_config_path(request.form.get("output_dir", ""), "Carpeta de episodios")
         new_config["metadata_dir"] = validate_config_path(request.form.get("metadata_dir", ""), "Carpeta de metadatos")
         quality = request.form.get("quality", "max").strip().lower() or "max"
-        if quality not in {"max", "1080p", "720p", "480p"}:
+        if quality not in {"max", "2160p", "1080p", "720p", "480p"}:
             raise ValueError("Calidad no válida.")
         new_config["quality"] = quality
         new_config["jellyfin_url"] = validate_remote_url(request.form.get("jellyfin_url", ""), allow_private=True)
@@ -1990,6 +2095,9 @@ def save_setup():
     except ValueError as e:
         flash(str(e), "error")
         return redirect(url_for("setup"))
+    global _catalog_cache
+    _catalog_cache = {"data": None, "ts": 0.0}
+    _pixeldrain_episode_cache.clear()
     _jf_user_cache["id"] = None
     _jf_series_cache["id"] = None
     _jf_seasons_cache["data"] = None
@@ -2025,7 +2133,7 @@ def check_setup():
         validate_csrf()
     if request.endpoint in {"login", "login_submit", "setup", "save_setup", "sync_metadata_route", "img_show_poster",
                              "img_show_backdrop", "img_season_poster", "api_jobs", "api_jobs_clear",
-                             "api_jobs_cancel", "api_job_cancel", "api_job_retry", "favicon", "static"}:
+                             "api_jobs_cancel", "api_job_cancel", "api_job_retry", "api_cache_clear", "favicon", "static"}:
         return
     config = cargar_config()
     if not config_completa(config):

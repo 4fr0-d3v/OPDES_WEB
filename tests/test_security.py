@@ -2,8 +2,10 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path
 
 import pytest
+import requests
 
 import src.opdes_web_app as webapp
 
@@ -31,6 +33,22 @@ def isolated_app(tmp_path, monkeypatch):
     )
     webapp.app.config.update(TESTING=True, WTF_CSRF_ENABLED=False)
     return webapp.app
+
+
+@pytest.fixture(autouse=True)
+def _reset_module_state():
+    yield
+    webapp._jobs.clear()
+    webapp._cancel_flags.clear()
+    webapp._job_queue.clear()
+    webapp._catalog_cache = {"data": None, "ts": 0.0}
+    webapp._pixeldrain_episode_cache.clear()
+    webapp._jf_user_cache["id"] = None
+    webapp._jf_user_cache["ts"] = 0.0
+    webapp._jf_series_cache["id"] = None
+    webapp._jf_series_cache["ts"] = 0.0
+    webapp._jf_seasons_cache["data"] = None
+    webapp._jf_seasons_cache["ts"] = 0.0
 
 
 def csrf_from(html: str) -> str:
@@ -191,3 +209,232 @@ def test_bulk_episode_download_endpoint_starts_selected_jobs(isolated_app, monke
 
     assert response.status_code == 200
     assert response.get_json()["job_ids"] == ["ep-1-1"]
+
+
+def test_limpiar_temporales_no_borra_descargas_concurrentes(tmp_path):
+    output_dir = tmp_path / "out"
+    activo = output_dir / "_tmp" / "arc-en-curso"
+    activo.mkdir(parents=True)
+    activo_file = activo / "ep01.mkv.part"
+    activo_file.write_bytes(b"partial")
+
+    terminado = output_dir / "_tmp" / "arc-terminado"
+    terminado.mkdir(parents=True)
+    (terminado / "ep01.mkv.part").write_bytes(b"viejo")
+
+    webapp.limpiar_temporales_si_ok(output_dir, slug="arc-terminado")
+
+    assert not terminado.exists()
+    assert activo_file.exists(), "no debe borrar tmp de jobs concurrentes"
+
+
+def test_limpiar_temporales_no_escanea_arbol_completo(tmp_path, monkeypatch):
+    output_dir = tmp_path / "out"
+    (output_dir / "Season 1").mkdir(parents=True)
+    (output_dir / "Season 1" / "S01E01.mkv").write_bytes(b"video")
+
+    calls = []
+    real_rglob = Path.rglob
+
+    def spy(self, pattern):
+        calls.append((str(self), pattern))
+        return real_rglob(self, pattern)
+
+    monkeypatch.setattr(Path, "rglob", spy)
+
+    webapp.limpiar_temporales_si_ok(output_dir, slug="x")
+
+    assert not any(str(output_dir) in c[0] for c in calls), \
+        f"limpiar_temporales no debe recorrer output_dir entero: {calls}"
+
+
+def test_job_cancel_force_libera_jobs_colgados(isolated_app):
+    webapp.job_create("zombie-1", "Zombie", lambda jid: None, ())
+    webapp._jobs["zombie-1"]["status"] = "running"
+    webapp._jobs["zombie-1"]["started_at"] = 0
+
+    with isolated_app.test_client() as client:
+        setup_response = client.get("/setup")
+        token = csrf_from(setup_response.get_data(as_text=True))
+        resp = client.post(
+            "/api/jobs/zombie-1/cancel?force=1",
+            headers={"X-CSRF-Token": token},
+        )
+
+    assert resp.status_code == 200
+    assert webapp._jobs["zombie-1"]["status"] == "cancelled"
+
+
+def test_setup_page_title_es_dinamico(isolated_app):
+    with isolated_app.test_client() as client:
+        html = client.get("/setup").get_data(as_text=True)
+    assert "<title>Configuración" in html or "<title>Configuracion" in html
+
+
+def test_setup_indica_path_inaccesible(isolated_app):
+    webapp.guardar_config({
+        **webapp.DEFAULT_CONFIG,
+        "output_dir": "/no/existe/output",
+        "metadata_dir": "/no/existe/meta",
+    })
+    with isolated_app.test_client() as client:
+        html = client.get("/setup").get_data(as_text=True)
+    assert "no es accesible" in html.lower()
+
+
+def test_toggle_watched_falla_si_jellyfin_devuelve_error(isolated_app, monkeypatch):
+    monkeypatch.setattr(webapp, "jellyfin_get_user_id", lambda cfg: "u1")
+    monkeypatch.setattr(
+        webapp,
+        "jellyfin_season_data",
+        lambda s, cfg: {1: {"id": "i1", "played": False}},
+    )
+
+    class FakeResp:
+        status_code = 500
+
+        def raise_for_status(self):
+            raise requests.HTTPError("boom")
+
+    monkeypatch.setattr(webapp.requests, "post", lambda *a, **k: FakeResp())
+
+    with isolated_app.test_client() as client:
+        token = csrf_from(client.get("/setup").get_data(as_text=True))
+        resp = client.post(
+            "/api/jellyfin/watched/1/1",
+            headers={"X-CSRF-Token": token},
+        )
+
+    assert resp.status_code == 502
+    assert resp.get_json()["ok"] is False
+
+
+def test_jellyfin_get_user_id_reintenta_en_fallo_transitorio(monkeypatch):
+    calls = {"n": 0}
+
+    class GoodResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{
+                "Id": "u1",
+                "Name": "kilian",
+                "Policy": {"IsAdministrator": True},
+            }]
+
+    def flaky(method, url, **kw):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise requests.ConnectionError("blip")
+        return GoodResp()
+
+    monkeypatch.setattr(webapp.requests, "request", flaky)
+    webapp._jf_user_cache["id"] = None
+    webapp._jf_user_cache["ts"] = 0.0
+    uid = webapp.jellyfin_get_user_id({
+        "jellyfin_url": "http://x",
+        "jellyfin_token": "t",
+        "jellyfin_user": "kilian",
+    })
+    assert uid == "u1"
+    assert calls["n"] == 2
+
+
+def test_api_cache_clear_resetea_caches(isolated_app):
+    webapp._catalog_cache = {"data": ["x"], "ts": 9999999999.0}
+    webapp._pixeldrain_episode_cache["http://x"] = {"episodes": [1], "ts": 9999999999.0}
+    webapp._jf_user_cache["id"] = "cache"
+    webapp._jf_user_cache["ts"] = 9999999999.0
+
+    with isolated_app.test_client() as client:
+        token = csrf_from(client.get("/setup").get_data(as_text=True))
+        resp = client.post("/api/cache/clear", headers={"X-CSRF-Token": token})
+
+    assert resp.status_code == 200
+    assert resp.get_json()["ok"] is True
+    assert webapp._catalog_cache["data"] is None
+    assert webapp._pixeldrain_episode_cache == {}
+    assert webapp._jf_user_cache["id"] is None
+
+
+def test_descargar_episodio_bg_single_file_rechaza_episodio_distinto(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "extraer_tipo_e_id", lambda u: ("file", "abc"))
+    monkeypatch.setattr(
+        webapp,
+        "pedir_json_resistente",
+        lambda path, url: {"name": "[One Pace][1080p] Arc 05 [crc][quality][12345678].mkv"},
+    )
+    monkeypatch.setattr(webapp, "archivo_ya_existe_en_destino_final", lambda *a, **k: None)
+    monkeypatch.setattr(webapp, "construir_indice_metadatos", lambda md: {})
+
+    webapp.job_create("ep-1-3", "ep", lambda jid: None, ())
+    webapp.descargar_episodio_bg(
+        "ep-1-3",
+        {
+            "id": "arc",
+            "season_number": 1,
+            "opciones": [{"url": "https://pixeldrain.net/u/abc", "quality": "1080p"}],
+        },
+        3,
+        {
+            "output_dir": str(tmp_path / "out"),
+            "metadata_dir": str(tmp_path / "meta"),
+            "quality": "max",
+        },
+    )
+    assert webapp._jobs["ep-1-3"]["status"] == "error"
+    assert "no coincide" in webapp._jobs["ep-1-3"]["msg"].lower()
+
+
+def test_extraer_calidad_detecta_2160p_y_4k():
+    assert webapp.extraer_calidad_desde_texto("One Pace 2160p HEVC") == "2160p"
+    assert webapp.extraer_calidad_desde_texto("Arco 4K") == "2160p"
+    assert webapp.ordenar_calidades("2160p") > webapp.ordenar_calidades("1080p")
+
+
+def test_warning_si_no_auth_configurada_en_desarrollo(monkeypatch, capsys):
+    monkeypatch.delenv("OPDES_ENV", raising=False)
+    monkeypatch.delenv("OPDES_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("OPDES_ADMIN_USER", raising=False)
+    monkeypatch.delenv("OPDES_ADMIN_PASSWORD_HASH", raising=False)
+    webapp.warn_if_no_admin_auth()
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "sin autenticacion" in err.lower() or "sin autenticación" in err.lower()
+
+
+def test_no_warning_en_produccion_con_token(monkeypatch, capsys):
+    monkeypatch.setenv("OPDES_ENV", "production")
+    monkeypatch.setenv("OPDES_ADMIN_TOKEN", "tok")
+    webapp.warn_if_no_admin_auth()
+    err = capsys.readouterr().err
+    assert "WARNING" not in err
+
+
+def test_save_setup_invalida_catalog_y_pixeldrain_cache(isolated_app):
+    webapp._catalog_cache = {"data": ["x"], "ts": 9999999999.0}
+    webapp._pixeldrain_episode_cache["http://x"] = {"episodes": [1], "ts": 9999999999.0}
+
+    with isolated_app.test_client() as client:
+        token = csrf_from(client.get("/setup").get_data(as_text=True))
+        resp = client.post(
+            "/setup",
+            data={
+                "csrf_token": token,
+                "url": webapp.DEFAULT_CONFIG["url"],
+                "output_dir": str(webapp.CONFIG_PATH.parent),
+                "metadata_dir": str(webapp.CONFIG_PATH.parent),
+                "quality": "max",
+                "jellyfin_url": "",
+                "jellyfin_token": "",
+                "jellyfin_user": "",
+                "jellyfin_series": "One Piece",
+            },
+        )
+
+    assert resp.status_code == 302
+    assert webapp._catalog_cache["data"] is None
+    assert webapp._pixeldrain_episode_cache == {}
